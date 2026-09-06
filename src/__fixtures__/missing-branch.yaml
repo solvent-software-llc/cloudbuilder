@@ -6,4 +6,3 @@ aws:
   hosted_zone_id: HS1234
 environments:
   - name: production
-    branch: main

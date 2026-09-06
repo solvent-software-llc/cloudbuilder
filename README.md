@@ -48,7 +48,7 @@ stack rather than creating a new one.
 | `aws.hosted_zone_id`    | yes      | Route53 hosted zone ID for `domain`.                                        |
 | `aws.stack_name`        | no       | CloudFormation stack name. Defaults to `<slug>-site`.                       |
 | `aws.bucket_name`       | no       | S3 bucket name. Defaults to `<domain>-site`.                                |
-| `environments`          | yes      | List of `{ name, subdomain? }`. One entry with no `subdomain` is the production/root site; entries with a `subdomain` are routed to `<subdomain>.<domain>` and served from the `/<subdomain>` prefix in the bucket. |
+| `environments`          | yes      | List of `{ name, branch, subdomain? }`. One entry with no `subdomain` is the production/root site; entries with a `subdomain` are routed to `<subdomain>.<domain>` and served from the `/<subdomain>` prefix in the bucket. Each `branch` must be unique — it's what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
 
@@ -108,11 +108,11 @@ establishes that AWS will accept GitHub's tokens at all.
    ```
    This creates an IAM role (`github-deploy-<slug>-<repo>`) that
    `github.org/<repo>`'s GitHub Actions workflow can assume via OIDC —
-   scoped to pushes to that repo's `main` and `dev` branches only, and
-   permitted to manage only this client's CloudFormation stack, S3 bucket,
-   and Route53 hosted zone (CloudFront and ACM cannot be scoped to a single
-   resource; see the comments in `src/github-deploy-role.ts`). Note the
-   `RoleArn` output and put it in that repo's deploy workflow.
+   scoped to pushes to exactly the branches listed in `environments[].branch`,
+   and permitted to manage only this client's CloudFormation stack, S3
+   bucket, and Route53 hosted zone (CloudFront and ACM cannot be scoped to a
+   single resource; see the comments in `src/github-deploy-role.ts`). Note
+   the `RoleArn` output and put it in that repo's deploy workflow.
 
 ## Updating an existing client
 

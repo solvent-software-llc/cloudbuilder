@@ -1,21 +1,12 @@
 slug: solvent-software
 name: "solvent software"
 domain: "solventsoftware.com"
-www: false
-public_env:
-  PUBLIC_KEY: value
 aws:
   region: us-east-1
   hosted_zone_id: HS1234
-  stack_name: custom-stack
-  bucket_name: custom-bucket
 environments:
   - name: production
     branch: main
   - name: "preview build"
     subdomain: preview
-    branch: dev
-github:
-  org: solvent-software-llc
-  repos:
-    - example-site
+    branch: main

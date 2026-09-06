@@ -11,8 +11,10 @@ aws:
   bucket_name: custom-bucket
 environments:
   - name: production
+    branch: main
   - name: "preview build"
     subdomain: preview
+    branch: dev
 github:
   org: solvent-software-llc
   repos:

@@ -16,15 +16,15 @@ on:
         required: false
         type: string
         default: '22'
-      deploy-target:
+      branch:
         description: >
-          'production' syncs the build to the bucket root and serves it from
-          the primary domain(s). 'preview' syncs to the preview/ prefix,
-          served from client.yaml's preview environment subdomain — that
-          environment must be declared.
+          Branch to deploy. Matched against client.yaml's environments[].branch
+          to pick the target environment (production, preview, ...) — the key
+          prefix, subdomain, and stack it deploys to all follow from that
+          environment. Defaults to the branch that triggered the run.
         required: false
         type: string
-        default: production
+        default: ${{ github.ref_name }}
 
 permissions:
   id-token: write
@@ -65,37 +65,16 @@ jobs:
         run: npm ci
 
       # client.yaml is the single source of truth for both the CDK stack and the
-      # deploy steps below, so read it once, here, rather than duplicating
-      # slug/stack-name/region across every client repo's workflows.
-      - name: Read client.yaml
-        id: cfg
+      # deploy steps below. Branch -> environment matching (and the "no
+      # environment declares this branch" error) lives in cloudbuilder's own
+      # config.ts, not reimplemented here with yq — see bin/resolve-env.ts.
+      - name: Resolve environment
+        id: env
+        working-directory: .cloudbuilder
         env:
-          CONFIG_PATH: ${{ inputs.config-path }}
-        run: |
-          STACK=$(yq -r '.aws.stack_name' "$CONFIG_PATH")
-          REGION=$(yq -r '.aws.region' "$CONFIG_PATH")
-          DOMAIN=$(yq -r '.domain' "$CONFIG_PATH")
-          if [ "$STACK" = "null" ] || [ "$REGION" = "null" ] || [ "$DOMAIN" = "null" ]; then
-            echo "::error::$CONFIG_PATH is missing aws.stack_name, aws.region, or domain"
-            exit 1
-          fi
-          echo "stack=$STACK" >> "$GITHUB_OUTPUT"
-          echo "region=$REGION" >> "$GITHUB_OUTPUT"
-          echo "domain=$DOMAIN" >> "$GITHUB_OUTPUT"
-
-      - name: Validate deploy target
-        id: preview
-        if: inputs.deploy-target == 'preview'
-        env:
-          CONFIG_PATH: ${{ inputs.config-path }}
-          DOMAIN: ${{ steps.cfg.outputs.domain }}
-        run: |
-          SUBDOMAIN=$(yq -r '.environments[] | select(.subdomain) | .subdomain' "$CONFIG_PATH" | head -n1)
-          if [ -z "$SUBDOMAIN" ]; then
-            echo "::error::deploy-target is 'preview' but $CONFIG_PATH has no environments[] entry with a subdomain"
-            exit 1
-          fi
-          echo "domain=$SUBDOMAIN.$DOMAIN" >> "$GITHUB_OUTPUT"
+          CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
+          BRANCH: ${{ inputs.branch }}
+        run: npx ts-node bin/resolve-env.ts
 
       - run: npm run check
       - run: npm run lint
@@ -107,20 +86,20 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ inputs.aws-role-arn }}
-          aws-region: ${{ steps.cfg.outputs.region }}
+          aws-region: ${{ steps.env.outputs.region }}
           role-skip-session-tagging: true
 
       - name: Deploy infrastructure
         working-directory: .cloudbuilder
         env:
           CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
-          STACK: ${{ steps.cfg.outputs.stack }}
+          STACK: ${{ steps.env.outputs.stack }}
         run: npx cdk deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json
 
       - name: Read stack outputs
         id: stack
         env:
-          STACK: ${{ steps.cfg.outputs.stack }}
+          STACK: ${{ steps.env.outputs.stack }}
         run: |
           OUT=.cloudbuilder/cdk-outputs.json
           BUCKET=$(jq -r --arg s "$STACK" '.[$s].BucketName' "$OUT")
@@ -131,39 +110,26 @@ jobs:
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
           echo "dist=$DIST" >> "$GITHUB_OUTPUT"
 
-      # preview builds land under a preview/ key prefix in the same bucket, routed by
-      # the distribution's UrlRewriteFunction — see cloudbuilder's static-site.ts.
-      # Production is unprefixed.
-      - name: Resolve key prefix
-        id: prefix
-        env:
-          TARGET: ${{ inputs.deploy-target }}
-        run: |
-          if [ "$TARGET" = "preview" ]; then
-            echo "prefix=preview/" >> "$GITHUB_OUTPUT"
-          else
-            echo "prefix=" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Content-hashed assets go first so freshly-deployed HTML never references a chunk
-      # that hasn't landed. No --delete: a client holding the previous index.html still
-      # needs the old chunks. The bucket lifecycle rule expires them after 30 days.
+      # preview (and any other non-production) environments land under a
+      # <subdomain>/ key prefix in the same bucket, routed by the distribution's
+      # UrlRewriteFunction — see cloudbuilder's static-site.ts. Production
+      # (no subdomain) is unprefixed.
       - name: Sync immutable assets
         env:
           BUCKET: ${{ steps.stack.outputs.bucket }}
-          PREFIX: ${{ steps.prefix.outputs.prefix }}
+          PREFIX: ${{ steps.env.outputs.prefix }}
         run: |
           aws s3 sync ./build/_app/immutable "s3://$BUCKET/${PREFIX}_app/immutable" \
             --exclude '*.DS_Store' \
             --cache-control 'public,max-age=31536000,immutable'
 
       # Stable filenames must revalidate on every visit. --delete here so the bucket
-      # mirrors the build exactly. Scoped to the prefix so a preview sync's --delete
-      # never touches production objects (or vice versa) in the shared bucket.
+      # mirrors the build exactly. Scoped to the prefix so one environment's --delete
+      # never touches another's objects in the shared bucket.
       - name: Sync unversioned files
         env:
           BUCKET: ${{ steps.stack.outputs.bucket }}
-          PREFIX: ${{ steps.prefix.outputs.prefix }}
+          PREFIX: ${{ steps.env.outputs.prefix }}
         run: |
           aws s3 sync ./build "s3://$BUCKET/$PREFIX" \
             --delete \
@@ -174,7 +140,7 @@ jobs:
       - name: Invalidate CloudFront
         env:
           DIST: ${{ steps.stack.outputs.dist }}
-          PREFIX: ${{ steps.prefix.outputs.prefix }}
+          PREFIX: ${{ steps.env.outputs.prefix }}
         run: |
           aws cloudfront create-invalidation \
             --distribution-id "$DIST" \
@@ -182,20 +148,14 @@ jobs:
 
       - name: Summary
         env:
-          TARGET: ${{ inputs.deploy-target }}
-          DOMAIN: ${{ steps.cfg.outputs.domain }}
-          PREVIEW_DOMAIN: ${{ steps.preview.outputs.domain }}
-          STACK: ${{ steps.cfg.outputs.stack }}
+          ENVIRONMENT: ${{ steps.env.outputs.environment }}
+          DOMAIN: ${{ steps.env.outputs.target-domain }}
+          STACK: ${{ steps.env.outputs.stack }}
           BUCKET: ${{ steps.stack.outputs.bucket }}
           DIST: ${{ steps.stack.outputs.dist }}
         run: |
-          if [ "$TARGET" = "preview" ]; then
-            URL="https://$PREVIEW_DOMAIN"
-          else
-            URL="https://$DOMAIN"
-          fi
           {
-            echo "### Deployed $URL"
+            echo "### Deployed $ENVIRONMENT to https://$DOMAIN"
             echo "- Stack: \`$STACK\`"
             echo "- Bucket: \`$BUCKET\`"
             echo "- Distribution: \`$DIST\`"

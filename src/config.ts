@@ -4,6 +4,7 @@ import * as yaml from "js-yaml";
 export interface Environment {
     name: string;
     subdomain?: string;
+    branch: string;
 }
 
 export interface Config {
@@ -58,13 +59,25 @@ export function load(path: string): Config {
     }
 
     const environments: Environment[] = [];
+    const seenBranches = new Set<string>();
     for (const env of raw.environments) {
         if (env.subdomain && !LABEL_RE.test(env.subdomain)) {
             throw new Error(
                 `client.yaml: environments[].subdomain "${env.subdomain}" must be a single DNS label`,
             );
         }
-        environments.push({ name: env.name, subdomain: env.subdomain });
+        if (!env.branch) {
+            throw new Error(
+                `client.yaml: environments[].branch is required (environment "${env.name}" has none)`,
+            );
+        }
+        if (seenBranches.has(env.branch)) {
+            throw new Error(
+                `client.yaml: environments[].branch "${env.branch}" is used by more than one environment`,
+            );
+        }
+        seenBranches.add(env.branch);
+        environments.push({ name: env.name, subdomain: env.subdomain, branch: env.branch });
     }
 
     let github: Config["github"];
@@ -106,4 +119,15 @@ export function load(path: string): Config {
         environments: environments,
         github: github,
     };
+}
+
+export function resolveEnvironment(config: Config, branch: string): Environment {
+    const env = config.environments.find((e) => e.branch === branch);
+    if (!env) {
+        const known = config.environments.map((e) => e.branch).join(", ");
+        throw new Error(
+            `client.yaml: no environments[] entry has branch "${branch}" (known branches: ${known})`,
+        );
+    }
+    return env;
 }

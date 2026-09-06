@@ -7,7 +7,6 @@ export interface GithubDeployRoleProps extends cdk.StackProps {
     config: Config;
     githubOrg: string;
     repoName: string;
-    branches?: string[];
 }
 
 export class GithubDeployRole extends cdk.Stack {
@@ -15,7 +14,11 @@ export class GithubDeployRole extends cdk.Stack {
         super(scope, id, props);
 
         const { config, githubOrg, repoName } = props;
-        const branches = props.branches ?? ["main", "dev"];
+        // The trust policy must allow exactly the branches client.yaml actually
+        // deploys from — kept in sync with environments[] rather than a
+        // hardcoded guess, so a new environment's branch is trusted the moment
+        // it's added to client.yaml.
+        const branches = config.environments.map((e) => e.branch);
 
         // GitHub appends `@<immutable-id>` to the org and/or repo name in the sub
         // claim once either has ever been renamed (anti repo-jacking measure), so

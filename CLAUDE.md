@@ -139,14 +139,18 @@ The called workflow resolves `GITHUB_JOB_WORKFLOW_REF` to see which ref the
 caller pinned, then checks this repo out again at that same ref into
 `.cloudbuilder/` — so the CDK code that actually runs `cdk deploy` is always
 the version the caller asked for, not whatever `main` happens to be. It then
-builds the client's site, reads `client.yaml` (via `yq`, path configurable
-through the `config-path` input) for the stack name/region/domain, runs
-`cdk deploy` with `--outputs-file`, and does a two-pass S3 sync (immutable
-assets first, no `--delete`; then everything else, with `--delete`, scoped
-to the deploy-target's key prefix) plus a CloudFront invalidation. A
-`deploy-target: preview` input syncs to the `<subdomain>/` key prefix
-instead of the bucket root — the client's `environments` must actually
-declare that subdomain, or the workflow fails fast.
+builds the client's site, resolves a `branch` input (defaulting to the
+triggering branch) against `client.yaml`'s `environments[].branch` — via
+`bin/resolve-env.ts`, calling straight into `config.ts`'s `resolveEnvironment`
+rather than re-parsing the YAML with `yq` — to pick the stack name/region and
+the target environment's key prefix/domain, failing fast if no environment
+declares that branch. It then runs `cdk deploy` with `--outputs-file`, and
+does a two-pass S3 sync (immutable assets first, no `--delete`; then
+everything else, with `--delete`, scoped to the resolved environment's key
+prefix) plus a CloudFront invalidation. One workflow file covers every
+environment now — a client repo no longer needs a separate `preview.yml`
+wrapper with a hardcoded `deploy-target: preview`; adding a new environment
+is a `client.yaml` edit, not a new workflow.
 
 Changing this workflow's inputs/behavior is a breaking-change concern for
 every client repo that pins a ref to it, same as the old `workflows` repo —
