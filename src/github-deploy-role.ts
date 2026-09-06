@@ -25,6 +25,23 @@ export class GithubDeployRole extends cdk.Stack {
             `repo:${githubOrg}@*/${repoName}@*:ref:refs/heads/${branch}`,
         ]);
 
+        // The OIDC provider (github-oidc-bootstrap / src/oidc.ts) is a single,
+        // account-wide IAM resource — IAM has no concept of region. Its ARN is
+        // fully deterministic from the account id and provider URL, so it's
+        // built directly here rather than via Fn::ImportValue: CloudFormation
+        // exports are region-scoped, and this stack's region need not match
+        // whatever region github-oidc-bootstrap happened to be deployed in.
+        const oidcProviderArn = cdk.Arn.format(
+            {
+                service: "iam",
+                region: "",
+                account: this.account,
+                resource: "oidc-provider",
+                resourceName: "token.actions.githubusercontent.com",
+            },
+            this,
+        );
+
         const role = new iam.CfnRole(this, "DeployRole", {
             roleName: `github-deploy-${config.slug}-${repoName}`,
             assumeRolePolicyDocument: {
@@ -33,9 +50,7 @@ export class GithubDeployRole extends cdk.Stack {
                     {
                         Effect: "Allow",
                         Principal: {
-                            Federated: cdk.Fn.importValue(
-                                "github-actions-oidc-provider-arn",
-                            ),
+                            Federated: oidcProviderArn,
                         },
                         Action: "sts:AssumeRoleWithWebIdentity",
                         Condition: {
