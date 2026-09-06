@@ -177,6 +177,40 @@ export class GithubDeployRole extends cdk.Stack {
                                 Action: ["route53:GetChange"],
                                 Resource: "*",
                             },
+                            {
+                                // Every `cdk deploy` reads this parameter to confirm the
+                                // account/region's bootstrap stack is new enough. This role
+                                // deliberately does not assume the CDK bootstrap deploy/
+                                // file-publishing roles (those carry much broader,
+                                // account-wide permissions than this per-client role should
+                                // have) — cdk falls back to using this role's own
+                                // credentials directly, so it needs this one read itself.
+                                Sid: "CdkBootstrapVersion",
+                                Effect: "Allow",
+                                Action: ["ssm:GetParameter"],
+                                Resource: `arn:aws:ssm:${this.region}:${this.account}:parameter/cdk-bootstrap/*/version`,
+                            },
+                            {
+                                // Same fallback as above: with the bootstrap file-publishing
+                                // role not assumed, this role uploads the synthesized
+                                // template/assets to the bootstrap staging bucket directly.
+                                // Bucket name follows CDK's default bootstrap naming
+                                // (qualifier "hnb659fds"); update this if the target
+                                // account/region was ever bootstrapped with a custom
+                                // --qualifier.
+                                Sid: "CdkAssetPublishing",
+                                Effect: "Allow",
+                                Action: [
+                                    "s3:GetBucketLocation",
+                                    "s3:ListBucket",
+                                    "s3:GetObject",
+                                    "s3:PutObject",
+                                ],
+                                Resource: [
+                                    `arn:aws:s3:::cdk-hnb659fds-assets-${this.account}-${this.region}`,
+                                    `arn:aws:s3:::cdk-hnb659fds-assets-${this.account}-${this.region}/*`,
+                                ],
+                            },
                         ],
                     },
                 },
