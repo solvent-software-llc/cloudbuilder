@@ -147,13 +147,13 @@ export class StaticSite extends cdk.Stack {
                     {
                         httpStatus: 404,
                         responseHttpStatus: 404,
-                        responsePagePath: "404.html",
+                        responsePagePath: "/404.html",
                         ttl: cdk.Duration.seconds(10),
                     },
                     {
                         httpStatus: 403,
                         responseHttpStatus: 404,
-                        responsePagePath: "404.html",
+                        responsePagePath: "/404.html",
                         ttl: cdk.Duration.seconds(10),
                     },
                 ],
