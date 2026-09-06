@@ -1,0 +1,7 @@
+name: "solvent software"
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+environments:
+  - name: production

@@ -1,0 +1,202 @@
+name: Static site deploy
+
+on:
+  workflow_call:
+    inputs:
+      aws-role-arn:
+        description: IAM role ARN for the client account (from the github-deploy-role stack output)
+        required: true
+        type: string
+      config-path:
+        description: Path to client.yaml in the calling repo
+        required: false
+        type: string
+        default: client.yaml
+      node-version:
+        required: false
+        type: string
+        default: '22'
+      deploy-target:
+        description: >
+          'production' syncs the build to the bucket root and serves it from
+          the primary domain(s). 'preview' syncs to the preview/ prefix,
+          served from client.yaml's preview environment subdomain — that
+          environment must be declared.
+        required: false
+        type: string
+        default: production
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # job_workflow_ref resolves to the ref the CALLER pinned (e.g. .../static-site-deploy.yml@v1),
+      # so the CDK app that runs cdk deploy is always version-locked to the workflow the caller used.
+      - name: Resolve cloudbuilder ref
+        id: cbref
+        run: echo "ref=${GITHUB_JOB_WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout cloudbuilder
+        uses: actions/checkout@v4
+        with:
+          repository: solvent-software-llc/cloudbuilder
+          ref: ${{ steps.cbref.outputs.ref }}
+          path: .cloudbuilder
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install site dependencies
+        run: npm ci
+
+      - name: Install cloudbuilder dependencies
+        working-directory: .cloudbuilder
+        run: npm ci
+
+      # client.yaml is the single source of truth for both the CDK stack and the
+      # deploy steps below, so read it once, here, rather than duplicating
+      # slug/stack-name/region across every client repo's workflows.
+      - name: Read client.yaml
+        id: cfg
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+        run: |
+          STACK=$(yq -r '.aws.stack_name' "$CONFIG_PATH")
+          REGION=$(yq -r '.aws.region' "$CONFIG_PATH")
+          DOMAIN=$(yq -r '.domain' "$CONFIG_PATH")
+          if [ "$STACK" = "null" ] || [ "$REGION" = "null" ] || [ "$DOMAIN" = "null" ]; then
+            echo "::error::$CONFIG_PATH is missing aws.stack_name, aws.region, or domain"
+            exit 1
+          fi
+          echo "stack=$STACK" >> "$GITHUB_OUTPUT"
+          echo "region=$REGION" >> "$GITHUB_OUTPUT"
+          echo "domain=$DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Validate deploy target
+        id: preview
+        if: inputs.deploy-target == 'preview'
+        env:
+          CONFIG_PATH: ${{ inputs.config-path }}
+          DOMAIN: ${{ steps.cfg.outputs.domain }}
+        run: |
+          SUBDOMAIN=$(yq -r '.environments[] | select(.subdomain) | .subdomain' "$CONFIG_PATH" | head -n1)
+          if [ -z "$SUBDOMAIN" ]; then
+            echo "::error::deploy-target is 'preview' but $CONFIG_PATH has no environments[] entry with a subdomain"
+            exit 1
+          fi
+          echo "domain=$SUBDOMAIN.$DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - run: npm run check
+      - run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          role-skip-session-tagging: true
+
+      - name: Deploy infrastructure
+        working-directory: .cloudbuilder
+        env:
+          CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
+          STACK: ${{ steps.cfg.outputs.stack }}
+        run: npx cdk deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json
+
+      - name: Read stack outputs
+        id: stack
+        env:
+          STACK: ${{ steps.cfg.outputs.stack }}
+        run: |
+          OUT=.cloudbuilder/cdk-outputs.json
+          BUCKET=$(jq -r --arg s "$STACK" '.[$s].BucketName' "$OUT")
+          DIST=$(jq -r --arg s "$STACK" '.[$s].DistributionId' "$OUT")
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "null" ] || [ -z "$DIST" ] || [ "$DIST" = "null" ]; then
+            echo "::error::stack did not return BucketName and DistributionId"; exit 1
+          fi
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "dist=$DIST" >> "$GITHUB_OUTPUT"
+
+      # preview builds land under a preview/ key prefix in the same bucket, routed by
+      # the distribution's UrlRewriteFunction — see cloudbuilder's static-site.ts.
+      # Production is unprefixed.
+      - name: Resolve key prefix
+        id: prefix
+        env:
+          TARGET: ${{ inputs.deploy-target }}
+        run: |
+          if [ "$TARGET" = "preview" ]; then
+            echo "prefix=preview/" >> "$GITHUB_OUTPUT"
+          else
+            echo "prefix=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Content-hashed assets go first so freshly-deployed HTML never references a chunk
+      # that hasn't landed. No --delete: a client holding the previous index.html still
+      # needs the old chunks. The bucket lifecycle rule expires them after 30 days.
+      - name: Sync immutable assets
+        env:
+          BUCKET: ${{ steps.stack.outputs.bucket }}
+          PREFIX: ${{ steps.prefix.outputs.prefix }}
+        run: |
+          aws s3 sync ./build/_app/immutable "s3://$BUCKET/${PREFIX}_app/immutable" \
+            --exclude '*.DS_Store' \
+            --cache-control 'public,max-age=31536000,immutable'
+
+      # Stable filenames must revalidate on every visit. --delete here so the bucket
+      # mirrors the build exactly. Scoped to the prefix so a preview sync's --delete
+      # never touches production objects (or vice versa) in the shared bucket.
+      - name: Sync unversioned files
+        env:
+          BUCKET: ${{ steps.stack.outputs.bucket }}
+          PREFIX: ${{ steps.prefix.outputs.prefix }}
+        run: |
+          aws s3 sync ./build "s3://$BUCKET/$PREFIX" \
+            --delete \
+            --exclude '_app/immutable/*' \
+            --exclude '*.DS_Store' \
+            --cache-control 'public,max-age=0,must-revalidate'
+
+      - name: Invalidate CloudFront
+        env:
+          DIST: ${{ steps.stack.outputs.dist }}
+          PREFIX: ${{ steps.prefix.outputs.prefix }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DIST" \
+            --paths "/${PREFIX}" "/${PREFIX}index.html" "/${PREFIX}404.html" "/${PREFIX}version.json"
+
+      - name: Summary
+        env:
+          TARGET: ${{ inputs.deploy-target }}
+          DOMAIN: ${{ steps.cfg.outputs.domain }}
+          PREVIEW_DOMAIN: ${{ steps.preview.outputs.domain }}
+          STACK: ${{ steps.cfg.outputs.stack }}
+          BUCKET: ${{ steps.stack.outputs.bucket }}
+          DIST: ${{ steps.stack.outputs.dist }}
+        run: |
+          if [ "$TARGET" = "preview" ]; then
+            URL="https://$PREVIEW_DOMAIN"
+          else
+            URL="https://$DOMAIN"
+          fi
+          {
+            echo "### Deployed $URL"
+            echo "- Stack: \`$STACK\`"
+            echo "- Bucket: \`$BUCKET\`"
+            echo "- Distribution: \`$DIST\`"
+          } >> "$GITHUB_STEP_SUMMARY"

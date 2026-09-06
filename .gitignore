@@ -1,0 +1,23 @@
+node_modules
+
+# CDK synth output and per-deploy stack outputs (static-site-deploy.yml writes
+# cdk-outputs.json here after `cdk deploy --outputs-file`)
+cdk.out
+cdk-outputs.json
+
+# Compiled output, in case anything is ever run through tsc instead of ts-node
+*.js
+*.d.ts
+
+# This repo, checked out into itself by static-site-deploy.yml so a client's
+# deploy runs against the ref the client pinned, not whatever's on disk
+/.cloudbuilder
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
