@@ -211,6 +211,24 @@ export class GithubDeployRole extends cdk.Stack {
                                     `arn:aws:s3:::cdk-hnb659fds-assets-${this.account}-${this.region}/*`,
                                 ],
                             },
+                            {
+                                // CloudFormation doesn't execute a changeset as the caller —
+                                // it assumes the bootstrap's cfn-exec-role, which carries
+                                // AdministratorAccess by default. This PassRole is what makes
+                                // that possible, which means every Sid above this point stops
+                                // being the real security boundary for anything cdk deploy
+                                // creates/updates (they still gate this role's own direct API
+                                // calls, e.g. this workflow's S3 sync / CloudFront invalidate
+                                // steps, just not stack deployment itself). The actual
+                                // boundary is now "which repo/branch can assume this role at
+                                // all" — enforced by the trust policy's sub claim above. See
+                                // CLAUDE.md for the narrower-but-unbuilt alternative (a custom
+                                // --cloudformation-execution-policies bootstrap).
+                                Sid: "PassCfnExecRole",
+                                Effect: "Allow",
+                                Action: ["iam:PassRole"],
+                                Resource: `arn:aws:iam::${this.account}:role/cdk-hnb659fds-cfn-exec-role-${this.account}-${this.region}`,
+                            },
                         ],
                     },
                 },

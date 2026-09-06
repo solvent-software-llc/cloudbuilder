@@ -74,6 +74,39 @@ requested in `us-east-1` regardless of where the rest of the client's
 infrastructure lives (see README's known limitation about cross-region
 certs).
 
+## The deploy role's IAM scoping is weaker than it looks — by design, for now
+
+`github-deploy-role.ts`'s policy is written per-service and per-resource (a
+specific bucket ARN, a specific hosted zone ARN, ...), reading like real
+least-privilege. It mostly isn't, for anything that goes through `cdk
+deploy`: CloudFormation doesn't execute a changeset as the caller. `cdk
+deploy` passes `--role-arn` pointing at the CDK bootstrap's
+`cdk-<qualifier>-cfn-exec-role-<account>-<region>`, and CloudFormation
+assumes *that* role to actually create/update/delete resources — and that
+role carries **`AdministratorAccess`** by default (this is standard CDK
+bootstrap behavior, not something this repo configured). The `PassCfnExecRole`
+Sid is what makes this possible; without it, `cdk deploy` fails outright
+(confirmed against a real account — see the deploy log this comment refers
+to in git history).
+
+Practical effect: everything else in this policy — `S3Site`, `CloudFront`,
+`ACM`, `Route53`, `CloudFormation` — still genuinely gates this role's own
+*direct* API calls (the deploy workflow's S3 sync and CloudFront invalidation
+steps run as this role, no PassRole involved). But it does **not** gate what
+`cdk deploy` itself can create or change — that runs as the admin exec role,
+account-wide. The real security boundary for infrastructure changes is "which
+GitHub repo/branch can assume this deploy role at all" (the OIDC trust
+policy's `sub` condition), not the resource-scoped Sids.
+
+This was a deliberate, explicit tradeoff (see the repo's commit history around
+the first live deploy) to unblock shipping now rather than build a narrower
+alternative first. That alternative, if it's ever worth the cost: bootstrap
+the account/region with a custom `--cloudformation-execution-policies` (a
+purpose-built managed policy scoped to S3/CloudFront/ACM/Route53/
+CloudFormation, no admin) instead of accepting CDK's default. That's a
+different bootstrap per account, more to maintain, and hasn't been built —
+don't assume it exists.
+
 ## Verifying changes without touching AWS
 
 `CONFIG_PATH=path/to/client.yaml npx cdk synth <stack-name> --no-staging`
