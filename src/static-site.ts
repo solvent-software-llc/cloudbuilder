@@ -3,6 +3,7 @@ import { Construct } from "constructs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
@@ -115,6 +116,37 @@ export class StaticSite extends cdk.Stack {
             `),
         });
 
+        // CloudFront's custom-error-page fetch (below) re-requests responsePagePath
+        // directly from the origin — it does NOT go through the viewer-request
+        // CloudFront Function above, so a prefixed environment (e.g. preview/) would
+        // otherwise 403 fetching the unprefixed "/404.html" and CloudFront would
+        // surface S3's raw AccessDenied XML instead of the 404 page. CloudFront
+        // Functions can't run on the origin-request event, so this one piece needs
+        // Lambda@Edge instead, mirroring PREFIX_BY_HOST from rewriteFn.
+        const errorPagePrefixFn = new cloudfront.experimental.EdgeFunction(
+            this,
+            "ErrorPagePrefixFunction",
+            {
+                functionName: `${config.slug}-error-page-prefix`,
+                runtime: lambda.Runtime.NODEJS_20_X,
+                handler: "index.handler",
+                code: lambda.Code.fromInline(`
+                    var PREFIX_BY_HOST = ${JSON.stringify(prefixByHost)};
+                    exports.handler = async (event) => {
+                        var request = event.Records[0].cf.request;
+                        if (request.uri === '/404.html') {
+                            var hostHeader = request.headers.host && request.headers.host[0];
+                            var prefix = hostHeader && PREFIX_BY_HOST[hostHeader.value];
+                            if (prefix) {
+                                request.uri = prefix + request.uri;
+                            }
+                        }
+                        return request;
+                    };
+                `),
+            },
+        );
+
         const distribution = new cloudfront.Distribution(
             this,
             "CloudFrontDistribution",
@@ -140,6 +172,12 @@ export class StaticSite extends cdk.Stack {
                         {
                             function: rewriteFn,
                             eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+                        },
+                    ],
+                    edgeLambdas: [
+                        {
+                            functionVersion: errorPagePrefixFn.currentVersion,
+                            eventType: cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
                         },
                     ],
                 },
