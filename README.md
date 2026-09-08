@@ -54,6 +54,61 @@ stack rather than creating a new one.
 
 See `example/client.yaml` for a working example.
 
+## Request flow
+
+Every request to a client's CloudFront distribution passes through the same
+pipeline regardless of which environment's domain it's addressed to; only
+the *data* threaded through that pipeline differs (the resolved key prefix).
+Tracing a request end to end:
+
+1. **Viewer request → `UrlRewriteFunction`** (CloudFront Function,
+   `viewer-request`; runs on every request, before the cache is checked).
+   Reads the `Host` header — still the viewer's original host here
+   (`example.com`, `preview.example.com`, ...) — and:
+   - Appends `index.html` (trailing-slash URI) or `.html` (extensionless
+     URI): the "clean URL" rewrite.
+   - Looks up `Host` in `PREFIX_BY_HOST` (built from `environments[].subdomain`)
+     and, on a match, prepends that environment's `/<subdomain>` prefix to
+     the URI. The one entry with no `subdomain` (production) gets no
+     prefix — its content sits at the bucket root.
+   - Stashes the resolved prefix (or `''` for production) into a custom
+     `X-Env-Prefix` request header, for step 3 to use later.
+
+   So `example.com/about` → `/about.html` (bucket root), while
+   `preview.example.com/about` → `/preview/about.html`.
+2. **Cache lookup.** `CachePolicy.CACHING_OPTIMIZED` computes the cache key
+   from the (already-rewritten) URI. A hit serves straight from the edge; a
+   miss forwards to the origin.
+3. **Origin request → `ErrorPagePrefixFunction`** (Lambda@Edge,
+   `origin-request`; only runs on a cache miss, right before CloudFront
+   forwards to S3). By this point CloudFront has already overwritten `Host`
+   with the *origin's* hostname (the S3 bucket endpoint) — the viewer's
+   original host is gone. That's what step 1's `X-Env-Prefix` header is for:
+   the `ForwardEnvPrefixHeader` `OriginRequestPolicy` is what keeps that
+   header alive from the viewer request through to here (without it,
+   `CachePolicy.CACHING_OPTIMIZED` alone forwards almost nothing, and the
+   header would be dropped before this function ever ran). The function
+   only acts if `uri === '/404.html'` (see step 5); for a normal request
+   it's a no-op passthrough.
+4. **S3 origin (via OAC).** CloudFront requests the (prefixed) key from the
+   bucket. Found → 200, served (and cached going forward). Not found → S3
+   (`BlockPublicAccess.BLOCK_ALL` + OAC) returns 403.
+5. **Error response → re-fetch `/404.html`.** The distribution's
+   `errorResponses` map both 403 and 404 from the origin to a synthetic
+   fetch of `/404.html`, returned to the viewer as an actual 404. That
+   internal re-fetch skips `UrlRewriteFunction` entirely — CloudFront never
+   re-runs `viewer-request` for it — so without step 3 it would always ask
+   for the bucket-root `/404.html`, regardless of which environment
+   errored. `ErrorPagePrefixFunction` rewrites it to `/<prefix>/404.html`
+   (using the `X-Env-Prefix` threaded through from step 1) right before it
+   goes to S3, so `preview.example.com`'s 404 serves preview's own 404
+   page — not production's, and not a raw S3 `AccessDenied` XML.
+
+For the root/production domain, `X-Env-Prefix` is always `''`, so step 5's
+rewrite is a no-op and `/404.html` resolves at the bucket root as-is — the
+whole prefix/header mechanism only does anything for a `subdomain`
+environment.
+
 > **Known limitation:** the ACM certificate is created in `aws.region`, but
 > CloudFront requires certificates to live in `us-east-1`. Until this is
 > fixed, set `aws.region: us-east-1` in every `client.yaml`.

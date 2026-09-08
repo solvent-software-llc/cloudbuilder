@@ -74,6 +74,33 @@ requested in `us-east-1` regardless of where the rest of the client's
 infrastructure lives (see README's known limitation about cross-region
 certs).
 
+**A subdomain environment's 404 page needs two separate fixes to actually
+render, not one.** See README's "Request flow" for the full trace; the
+gotcha is in steps 3 and 5. CloudFront's custom error response
+(`errorResponses`, mapping 403/404 → `/404.html`) makes a *second*, internal
+request to the origin for that path when the first one 403s/404s. That
+internal request skips `UrlRewriteFunction` entirely (CloudFront Functions
+never re-run on `viewer-request` for it), so without help it always asks for
+the bucket-root `/404.html` — wrong for every `subdomain` environment, whose
+actual 404 page lives at `/<subdomain>/404.html`, and either 403s (if
+production was never deployed) or silently serves *production's* 404 page
+(if it was). Fixing that needs Lambda@Edge on `origin-request`
+(`ErrorPagePrefixFunction`), because CloudFront Functions only support
+`viewer-request`/`viewer-response` — never `origin-request`/`origin-response`
+(`cloudfront.FunctionEventType` has no such variant; confirmed against a
+real account, this doesn't work no matter how it's wired). And that Lambda
+can't just read the `Host` header to figure out which prefix to apply: by
+the time `origin-request` runs, CloudFront has already overwritten `Host`
+with the *origin's* hostname (the S3 bucket endpoint), not the viewer's —
+also confirmed against a real account, via CloudWatch Logs showing the
+Lambda executing successfully but seeing the wrong host on every invocation.
+The actual fix threads the viewer's real host through as data:
+`UrlRewriteFunction` (which still sees it at `viewer-request` time) stashes
+the resolved prefix into a custom `X-Env-Prefix` header, and
+`ForwardEnvPrefixHeader` (an `OriginRequestPolicy`) is what keeps that
+header alive through to the `origin-request` Lambda — `CachePolicy.
+CACHING_OPTIMIZED` alone strips it before the Lambda ever sees it.
+
 ## The deploy role's IAM scoping is weaker than it looks — by design, for now
 
 `github-deploy-role.ts`'s policy is written per-service and per-resource (a

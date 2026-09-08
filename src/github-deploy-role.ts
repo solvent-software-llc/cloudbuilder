@@ -58,8 +58,7 @@ export class GithubDeployRole extends cdk.Stack {
                         Action: "sts:AssumeRoleWithWebIdentity",
                         Condition: {
                             StringEquals: {
-                                "token.actions.githubusercontent.com:aud":
-                                    "sts.amazonaws.com",
+                                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
                             },
                             StringLike: {
                                 "token.actions.githubusercontent.com:sub": subs,
@@ -181,26 +180,48 @@ export class GithubDeployRole extends cdk.Stack {
                                 Resource: "*",
                             },
                             {
-                                // Every `cdk deploy` reads this parameter to confirm the
-                                // account/region's bootstrap stack is new enough. This role
-                                // deliberately does not assume the CDK bootstrap deploy/
-                                // file-publishing roles (those carry much broader,
-                                // account-wide permissions than this per-client role should
-                                // have) — cdk falls back to using this role's own
-                                // credentials directly, so it needs this one read itself.
+                                // cdk deploy's standard, fully-supported call path: assume
+                                // the CDK bootstrap deploy-role for CloudFormation calls
+                                // (CreateChangeSet, ExecuteChangeSet, ...) and the
+                                // file-publishing-role to upload the synthesized
+                                // template/assets, rather than calling those services
+                                // directly as this role. The direct-credentials fallback
+                                // (used when assumption isn't permitted) was found to
+                                // silently report "no changes" for a genuine changeset —
+                                // CloudFormation created and described it correctly, but cdk
+                                // never called ExecuteChangeSet. Both bootstrap roles trust
+                                // the whole account already (Principal: root in their own
+                                // trust policy), so granting this doesn't widen the actual
+                                // security boundary: cfn-exec-role (assumed via
+                                // PassCfnExecRole below) already runs every real
+                                // create/update with AdministratorAccess account-wide
+                                // regardless of which identity calls CloudFormation — see
+                                // "The deploy role's IAM scoping is weaker than it looks" in
+                                // CLAUDE.md.
+                                Sid: "AssumeCdkBootstrapRoles",
+                                Effect: "Allow",
+                                Action: ["sts:AssumeRole", "sts:TagSession"],
+                                Resource: [
+                                    `arn:aws:iam::${this.account}:role/cdk-hnb659fds-deploy-role-${this.account}-${this.region}`,
+                                    `arn:aws:iam::${this.account}:role/cdk-hnb659fds-file-publishing-role-${this.account}-${this.region}`,
+                                ],
+                            },
+                            {
+                                // Kept as a fallback read in case bootstrap-role assumption
+                                // above ever fails for some reason — cdk falls back to using
+                                // this role's own credentials directly, and would need this.
                                 Sid: "CdkBootstrapVersion",
                                 Effect: "Allow",
                                 Action: ["ssm:GetParameter"],
                                 Resource: `arn:aws:ssm:${this.region}:${this.account}:parameter/cdk-bootstrap/*/version`,
                             },
                             {
-                                // Same fallback as above: with the bootstrap file-publishing
-                                // role not assumed, this role uploads the synthesized
-                                // template/assets to the bootstrap staging bucket directly.
-                                // Bucket name follows CDK's default bootstrap naming
-                                // (qualifier "hnb659fds"); update this if the target
-                                // account/region was ever bootstrapped with a custom
-                                // --qualifier.
+                                // Same fallback as above, for uploading the synthesized
+                                // template/assets directly if file-publishing-role
+                                // assumption ever fails. Bucket name follows CDK's default
+                                // bootstrap naming (qualifier "hnb659fds"); update this if
+                                // the target account/region was ever bootstrapped with a
+                                // custom --qualifier.
                                 Sid: "CdkAssetPublishing",
                                 Effect: "Allow",
                                 Action: [

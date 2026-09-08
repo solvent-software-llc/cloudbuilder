@@ -110,6 +110,14 @@ export class StaticSite extends cdk.Stack {
                         uri = prefix + uri;
                     }
 
+                    // Stashed for the origin-request Lambda@Edge function below: by
+                    // the time that runs, CloudFront has already overwritten the Host
+                    // header with the origin's own hostname, so the viewer's original
+                    // host (and thus which environment's prefix applies) is otherwise
+                    // unrecoverable there. This custom header survives through only
+                    // because of the OriginRequestPolicy allow-listing it below.
+                    request.headers['x-env-prefix'] = { value: prefix || '' };
+
                     request.uri = uri;
                     return request;
                 }
@@ -122,7 +130,12 @@ export class StaticSite extends cdk.Stack {
         // otherwise 403 fetching the unprefixed "/404.html" and CloudFront would
         // surface S3's raw AccessDenied XML instead of the 404 page. CloudFront
         // Functions can't run on the origin-request event, so this one piece needs
-        // Lambda@Edge instead, mirroring PREFIX_BY_HOST from rewriteFn.
+        // Lambda@Edge instead. It can't key off the Host header itself — by the
+        // time origin-request runs, CloudFront has already overwritten Host with
+        // the origin's own hostname — so it reads the X-Env-Prefix header that
+        // rewriteFn stashed at viewer-request time instead (see the
+        // OriginRequestPolicy below, which is what makes that header survive
+        // through to here).
         const errorPagePrefixFn = new cloudfront.experimental.EdgeFunction(
             this,
             "ErrorPagePrefixFunction",
@@ -131,12 +144,11 @@ export class StaticSite extends cdk.Stack {
                 runtime: lambda.Runtime.NODEJS_20_X,
                 handler: "index.handler",
                 code: lambda.Code.fromInline(`
-                    var PREFIX_BY_HOST = ${JSON.stringify(prefixByHost)};
                     exports.handler = async (event) => {
                         var request = event.Records[0].cf.request;
                         if (request.uri === '/404.html') {
-                            var hostHeader = request.headers.host && request.headers.host[0];
-                            var prefix = hostHeader && PREFIX_BY_HOST[hostHeader.value];
+                            var prefixHeader = request.headers['x-env-prefix'] && request.headers['x-env-prefix'][0];
+                            var prefix = prefixHeader && prefixHeader.value;
                             if (prefix) {
                                 request.uri = prefix + request.uri;
                             }
@@ -144,6 +156,19 @@ export class StaticSite extends cdk.Stack {
                         return request;
                     };
                 `),
+            },
+        );
+
+        const forwardEnvPrefixHeader = new cloudfront.OriginRequestPolicy(
+            this,
+            "ForwardEnvPrefixHeader",
+            {
+                originRequestPolicyName: `${config.slug}-forward-env-prefix`,
+                comment:
+                    "Forwards the X-Env-Prefix header rewriteFn sets, so ErrorPagePrefixFunction can read it",
+                headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList(
+                    "X-Env-Prefix",
+                ),
             },
         );
 
@@ -166,6 +191,7 @@ export class StaticSite extends cdk.Stack {
                         cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                     allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
                     cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+                    originRequestPolicy: forwardEnvPrefixHeader,
                     responseHeadersPolicy:
                         cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
                     functionAssociations: [
