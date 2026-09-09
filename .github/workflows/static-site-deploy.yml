@@ -16,6 +16,17 @@ on:
         required: false
         type: string
         default: '22'
+      cloudbuilder-ref:
+        description: >
+          The ref/tag of THIS reusable workflow that the caller pinned in its
+          own `uses: .../static-site-deploy.yml@X` line (e.g. "v1") — pass the
+          same value here so the CDK app checked out below matches the
+          version of this workflow that's actually running. `github.
+          job_workflow_ref`, which would otherwise let this be derived
+          automatically, is not populated in every Actions environment, so
+          this can't be resolved implicitly and must be passed explicitly.
+        required: true
+        type: string
       branch:
         description: >
           Branch to deploy. Matched against client.yaml's environments[].branch
@@ -38,17 +49,11 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # job_workflow_ref resolves to the ref the CALLER pinned (e.g. .../static-site-deploy.yml@v1),
-      # so the CDK app that runs cdk deploy is always version-locked to the workflow the caller used.
-      - name: Resolve cloudbuilder ref
-        id: cbref
-        run: echo "ref=${GITHUB_JOB_WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
-
       - name: Checkout cloudbuilder
         uses: actions/checkout@v4
         with:
           repository: solvent-software-llc/cloudbuilder
-          ref: ${{ steps.cbref.outputs.ref }}
+          ref: ${{ inputs.cloudbuilder-ref }}
           path: .cloudbuilder
 
       - name: Set up Node
