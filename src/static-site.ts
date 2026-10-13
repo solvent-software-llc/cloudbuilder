@@ -141,7 +141,7 @@ export class StaticSite extends cdk.Stack {
             "ErrorPagePrefixFunction",
             {
                 functionName: `${config.slug}-error-page-prefix`,
-                runtime: lambda.Runtime.NODEJS_20_X,
+                runtime: lambda.Runtime.NODEJS_24_X,
                 handler: "index.handler",
                 code: lambda.Code.fromInline(`
                     exports.handler = async (event) => {
