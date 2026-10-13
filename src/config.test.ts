@@ -116,6 +116,51 @@ describe("load", () => {
     });
 });
 
+describe("load: api", () => {
+    it("parses the api block with defaults and per-environment overrides", () => {
+        const config = load(fixture("api"));
+        expect(config.site).toBeUndefined();
+        expect(config.api).toStrictEqual({
+            module: "api",
+            main: "./cmd/lambda",
+            architecture: "arm64",
+            memoryMb: 512,
+            timeoutSeconds: 10,
+        });
+        expect(config.environments.map((e) => e.api)).toEqual([
+            {
+                stackName: "solvent-software-api",
+                domain: "api.solventsoftware.com",
+                env: { LOG_LEVEL: "warn", PAGE_SIZE: "50" },
+                secrets: { TOKEN_SIGNING_KEY: "/solvent/api/token-key" },
+            },
+            {
+                stackName: "preview-api",
+                domain: "api.preview.solventsoftware.com",
+                env: { LOG_LEVEL: "info", PAGE_SIZE: "50" },
+                secrets: { TOKEN_SIGNING_KEY: "/solvent/api/preview/token-key" },
+            },
+            undefined,
+        ]);
+    });
+    it("leaves api undefined everywhere without an api block", () => {
+        const config = load(fixture("all-values"));
+        expect(config.api).toBeUndefined();
+        expect(config.environments.every((e) => e.api === undefined)).toBe(true);
+    });
+    it.each([
+        ["api-secret-value", /must be an SSM parameter name .*never the secret value/],
+        ["api-reserved-env", /api\.env key "AWS_REGION" is reserved/],
+        ["api-timeout", /api\.timeout must be an integer from 1 to 30/],
+        ["api-subdomain", /subdomain "api" collides with the production API host/],
+        ["api-param-collision", /secret "KEY" .* exposed as KEY_PARAM/],
+        ["api-stack-collision", /stack name "solvent-software-site" is used by more than one stack/],
+        ["env-api-without-api", /environments\[\]\.api is set .* no top-level api block/],
+    ])("rejects %s", (name, error) => {
+        expect(() => load(fixture(name))).toThrow(error);
+    });
+});
+
 describe("resolveEnvironment", () => {
     it("finds the environment matching a branch", () => {
         const config = load(fixture("all-values"));

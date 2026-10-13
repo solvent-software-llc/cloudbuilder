@@ -1,0 +1,14 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+  env:
+    KEY_PARAM: x
+  secrets:
+    KEY: /a/b
+environments:
+  - name: production
+    branch: main
