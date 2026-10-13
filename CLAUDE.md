@@ -50,7 +50,11 @@ convention for a site). CloudFormation stack names must match
 IAM role name (both accept dots, and the trust policy must match GitHub's
 claim exactly) — don't sanitize those.
 
-**`www` must never apply to a subdomain environment.** In
+**`www` must never apply to a subdomain environment.** (V2 note: the
+prefix map below is gone, so the silent-fallthrough-to-production failure
+can't happen anymore, but `www.<subdomain>` would still become a real
+record, SAN, and alias. `static-site.ts` still gates `www` on
+`!environment.subdomain`.) In
 `config.environments`, only the entry with no `subdomain` is the root/production
 site — entries with a `subdomain` (preview, staging, ...) get `www` treatment
 too if you're not careful, e.g. `www.preview.<domain>`. Nobody links to that
@@ -74,8 +78,11 @@ requested in `us-east-1` regardless of where the rest of the client's
 infrastructure lives (see README's known limitation about cross-region
 certs).
 
-**A subdomain environment's 404 page needs two separate fixes to actually
-render, not one.** See README's "Request flow" for the full trace; the
+**(V1 only — removed in V2, kept as history.) A subdomain environment's 404
+page needed two separate fixes to actually render, not one.** V2 gives each
+environment its own bucket, so `/404.html` is always at the bucket root and
+none of the machinery below exists anymore. Don't reintroduce a shared
+bucket without rereading this. See README's "Request flow" for the full trace; the
 gotcha is in steps 3 and 5. CloudFront's custom error response
 (`errorResponses`, mapping 403/404 → `/404.html`) makes a *second*, internal
 request to the origin for that path when the first one 403s/404s. That
@@ -170,11 +177,10 @@ builds the client's site, resolves a `branch` input (defaulting to the
 triggering branch) against `client.yaml`'s `environments[].branch` — via
 `bin/resolve-env.ts`, calling straight into `config.ts`'s `resolveEnvironment`
 rather than re-parsing the YAML with `yq` — to pick the stack name/region and
-the target environment's key prefix/domain, failing fast if no environment
+the target environment's domain, failing fast if no environment
 declares that branch. It then runs `cdk deploy` with `--outputs-file`, and
 does a two-pass S3 sync (immutable assets first, no `--delete`; then
-everything else, with `--delete`, scoped to the resolved environment's key
-prefix) plus a CloudFront invalidation. One workflow file covers every
+everything else, with `--delete`, into the environment's own bucket) plus a CloudFront invalidation. One workflow file covers every
 environment now — a client repo no longer needs a separate `preview.yml`
 wrapper with a hardcoded `deploy-target: preview`; adding a new environment
 is a `client.yaml` edit, not a new workflow.
@@ -188,3 +194,7 @@ version for PR checks) — client repos still relying on the old
 `workflows`-repo validator will find it rejects `client.yaml`'s current
 schema (no `tier`, restructured `environments`) the first time it's actually
 exercised.
+
+## V2
+
+See docs/v2-redesign.md for decisions surrounding v2.

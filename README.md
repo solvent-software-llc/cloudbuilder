@@ -42,13 +42,14 @@ stack rather than creating a new one.
 | `slug`                  | yes      | Lowercase, hyphenated identifier (3-32 chars). Used to name AWS resources.  |
 | `domain`                | yes      | Root domain, e.g. `example.com`.                                            |
 | `name`                  | no       | Human-readable client name.                                                 |
-| `www`                   | no       | Also provision `www.<domain>` (and per-environment `www.` subdomains). Defaults to `true`. |
-| `public_env`            | no       | Map of `PUBLIC_`-prefixed build-time env vars (e.g. for SvelteKit).         |
+| `www`                   | no       | Also provision `www.<domain>` for the production environment (never for subdomain environments). Defaults to `true`. |
 | `aws.region`            | yes      | AWS region the stack is deployed to.                                       |
 | `aws.hosted_zone_id`    | yes      | Route53 hosted zone ID for `domain`.                                        |
-| `aws.stack_name`        | no       | CloudFormation stack name. Defaults to `<slug>-site`.                       |
-| `aws.bucket_name`       | no       | S3 bucket name. Defaults to `<domain>-site`.                                |
-| `environments`          | yes      | List of `{ name, branch, subdomain? }`. One entry with no `subdomain` is the production/root site; entries with a `subdomain` are routed to `<subdomain>.<domain>` and served from the `/<subdomain>` prefix in the bucket. Each `branch` must be unique — it's what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. |
+| `site`                  | no       | Static-site settings. **Site stacks are synthesized only if this block is present** (use `site: {}` for all defaults) — an API repo's `client.yaml` omits it. |
+| `site.stack_name`       | no       | Production's CloudFormation stack name. Defaults to `<slug>-site`.          |
+| `site.bucket_name`      | no       | Production's S3 bucket name. Defaults to `<domain>-site` — which contains dots, so always set this explicitly (see CLAUDE.md). |
+| `site.public_env`       | no       | Map of `PUBLIC_`-prefixed build-time env vars (e.g. for SvelteKit).         |
+| `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
 
@@ -56,58 +57,25 @@ See `example/client.yaml` for a working example.
 
 ## Request flow
 
-Every request to a client's CloudFront distribution passes through the same
-pipeline regardless of which environment's domain it's addressed to; only
-the *data* threaded through that pipeline differs (the resolved key prefix).
-Tracing a request end to end:
+Each environment has its own stack, bucket, and CloudFront distribution, so
+a request only ever touches that environment's resources:
 
 1. **Viewer request → `UrlRewriteFunction`** (CloudFront Function,
-   `viewer-request`; runs on every request, before the cache is checked).
-   Reads the `Host` header — still the viewer's original host here
-   (`example.com`, `preview.example.com`, ...) — and:
-   - Appends `index.html` (trailing-slash URI) or `.html` (extensionless
-     URI): the "clean URL" rewrite.
-   - Looks up `Host` in `PREFIX_BY_HOST` (built from `environments[].subdomain`)
-     and, on a match, prepends that environment's `/<subdomain>` prefix to
-     the URI. The one entry with no `subdomain` (production) gets no
-     prefix — its content sits at the bucket root.
-   - Stashes the resolved prefix (or `''` for production) into a custom
-     `X-Env-Prefix` request header, for step 3 to use later.
+   `viewer-request`). Appends `index.html` to a trailing-slash URI or
+   `.html` to an extensionless one (`/about` → `/about.html`).
+2. **Cache lookup** (`CachePolicy.CACHING_OPTIMIZED`). A miss forwards to
+   the origin.
+3. **S3 origin (via OAC).** Found → 200. Not found → S3 returns 403
+   (`BlockPublicAccess.BLOCK_ALL` + OAC).
+4. **Error response.** The distribution's `errorResponses` map 403 and 404
+   to `/404.html`, returned as a real 404. That internal fetch skips
+   `UrlRewriteFunction`, which is fine: every environment's `404.html` sits
+   at its own bucket's root.
 
-   So `example.com/about` → `/about.html` (bucket root), while
-   `preview.example.com/about` → `/preview/about.html`.
-2. **Cache lookup.** `CachePolicy.CACHING_OPTIMIZED` computes the cache key
-   from the (already-rewritten) URI. A hit serves straight from the edge; a
-   miss forwards to the origin.
-3. **Origin request → `ErrorPagePrefixFunction`** (Lambda@Edge,
-   `origin-request`; only runs on a cache miss, right before CloudFront
-   forwards to S3). By this point CloudFront has already overwritten `Host`
-   with the *origin's* hostname (the S3 bucket endpoint) — the viewer's
-   original host is gone. That's what step 1's `X-Env-Prefix` header is for:
-   the `ForwardEnvPrefixHeader` `OriginRequestPolicy` is what keeps that
-   header alive from the viewer request through to here (without it,
-   `CachePolicy.CACHING_OPTIMIZED` alone forwards almost nothing, and the
-   header would be dropped before this function ever ran). The function
-   only acts if `uri === '/404.html'` (see step 5); for a normal request
-   it's a no-op passthrough.
-4. **S3 origin (via OAC).** CloudFront requests the (prefixed) key from the
-   bucket. Found → 200, served (and cached going forward). Not found → S3
-   (`BlockPublicAccess.BLOCK_ALL` + OAC) returns 403.
-5. **Error response → re-fetch `/404.html`.** The distribution's
-   `errorResponses` map both 403 and 404 from the origin to a synthetic
-   fetch of `/404.html`, returned to the viewer as an actual 404. That
-   internal re-fetch skips `UrlRewriteFunction` entirely — CloudFront never
-   re-runs `viewer-request` for it — so without step 3 it would always ask
-   for the bucket-root `/404.html`, regardless of which environment
-   errored. `ErrorPagePrefixFunction` rewrites it to `/<prefix>/404.html`
-   (using the `X-Env-Prefix` threaded through from step 1) right before it
-   goes to S3, so `preview.example.com`'s 404 serves preview's own 404
-   page — not production's, and not a raw S3 `AccessDenied` XML.
-
-For the root/production domain, `X-Env-Prefix` is always `''`, so step 5's
-rewrite is a no-op and `/404.html` resolves at the bucket root as-is — the
-whole prefix/header mechanism only does anything for a `subdomain`
-environment.
+V1 served every environment from one shared bucket under key prefixes,
+which needed a host→prefix map, an `X-Env-Prefix` header, an
+`OriginRequestPolicy`, and a Lambda@Edge function to get step 4 right. See
+`docs/v2-redesign.md`.
 
 > **Known limitation:** the ACM certificate is created in `aws.region`, but
 > CloudFront requires certificates to live in `us-east-1`. Until this is
@@ -145,10 +113,10 @@ establishes that AWS will accept GitHub's tokens at all.
    ```
    CONFIG_PATH=path/to/client.yaml npx cdk deploy <stack-name>
    ```
-   `<stack-name>` is `aws.stack_name` from `client.yaml` (or `<slug>-site`
-   if unset) — required because with `CONFIG_PATH` set the app contains
-   both this stack and `github-oidc-bootstrap`, so `cdk` refuses to guess
-   which one you mean.
+   `<stack-name>` is the target environment's stack (see `environments` above;
+   `CONFIG_PATH=... npx cdk ls` lists them all). It's required because with
+   `CONFIG_PATH` set the app contains one stack per environment plus
+   `github-oidc-bootstrap`, so `cdk` refuses to guess which one you mean.
    This creates the S3 bucket, requests and DNS-validates the ACM
    certificate, creates the CloudFront distribution, and creates the
    Route53 A/AAAA records. Certificate validation can take several minutes.

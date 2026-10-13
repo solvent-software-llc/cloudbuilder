@@ -1,0 +1,18 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+site: {}
+environments:
+  - name: production
+    branch: main
+    site:
+      stack_name: prod-stack
+      bucket_name: prod-bucket
+  - name: staging
+    subdomain: staging
+    branch: staging
+    site:
+      stack_name: staging-stack
+      bucket_name: staging-bucket

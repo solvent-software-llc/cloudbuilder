@@ -3,48 +3,46 @@ import { Construct } from "constructs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
-import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
-import { Config } from "./config";
+import { Config, Environment } from "./config";
 
 export interface StaticSiteProps extends cdk.StackProps {
     config: Config;
+    environment: Environment;
+    site: NonNullable<Environment["site"]>;
 }
 
+// One stack, bucket, and distribution per environment. Construct ids and
+// production's physical names (OAC, function) deliberately match V1's single
+// shared stack, so a V1 production stack can be updated in place rather than
+// replaced — see docs/v2-redesign.md's migration notes before renaming any.
 export class StaticSite extends cdk.Stack {
     constructor(scope: Construct, id: string, props: StaticSiteProps) {
         super(scope, id, props);
 
-        const { config } = props;
+        const { config, environment, site } = props;
         const zone = route53.HostedZone.fromHostedZoneAttributes(this, "Zone", {
             hostedZoneId: config.aws.hostedZoneId,
             zoneName: config.domain,
         });
 
-        const domains: string[] = [];
-        const nonRootDomains: string[] = [];
-        for (const environment of config.environments) {
-            const domain = environment.subdomain
-                ? `${environment.subdomain}.${config.domain}`
-                : config.domain;
-            // www only ever applies to the root domain — a subdomain environment
-            // (preview, staging, ...) has no reason to answer on www.<subdomain>.<domain>,
-            // and the rewrite function's PREFIX_BY_HOST map only knows the bare host,
-            // so an unrewritten www variant would silently fall through to production.
-            if (config.www && !environment.subdomain) {
-                domains.push(`www.${domain}`);
-                nonRootDomains.push(`www.${domain}`);
-            }
-            domains.push(domain);
-            if (environment.subdomain) {
-                nonRootDomains.push(domain);
-            }
-        }
+        // Physical names must be unique per account; production keeps V1's.
+        const namePrefix = environment.subdomain
+            ? `${config.slug}-${environment.subdomain}`
+            : config.slug;
+
+        // www only ever applies to production — nobody links to
+        // www.<subdomain>.<domain>, and it would still become a real record,
+        // cert SAN, and alias.
+        const www = config.www && !environment.subdomain;
+        const domains = www
+            ? [`www.${environment.domain}`, environment.domain]
+            : [environment.domain];
 
         const bucket = new s3.Bucket(this, "SiteBucket", {
-            bucketName: config.aws.bucketName,
+            bucketName: site.bucketName,
             removalPolicy: cdk.RemovalPolicy.RETAIN,
             versioned: true,
             blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -66,8 +64,8 @@ export class StaticSite extends cdk.Stack {
         });
 
         const certificate = new acm.Certificate(this, "SiteCertificate", {
-            domainName: config.domain,
-            subjectAlternativeNames: nonRootDomains,
+            domainName: environment.domain,
+            subjectAlternativeNames: www ? [`www.${environment.domain}`] : [],
             validation: acm.CertificateValidation.fromDnsMultiZone(
                 Object.fromEntries(domains.map((domain) => [domain, zone])),
             ),
@@ -75,48 +73,26 @@ export class StaticSite extends cdk.Stack {
 
         const oac = new cloudfront.CfnOriginAccessControl(this, "CloudFrontOAC", {
             originAccessControlConfig: {
-                name: `${config.slug}-oac`,
+                name: `${namePrefix}-oac`,
                 originAccessControlOriginType: "s3",
                 signingBehavior: "always",
                 signingProtocol: "sigv4",
             },
         });
 
-        const prefixByHost: Record<string, string> = {};
-        for (const environment of config.environments) {
-            if (!environment.subdomain) continue;
-            prefixByHost[`${environment.subdomain}.${config.domain}`] =
-                `/${environment.subdomain}`;
-        }
         const rewriteFn = new cloudfront.Function(this, "UrlRewriteFunction", {
-            functionName: `${config.slug}-url-rewrite`,
-            comment:
-                "Rewrites clean URLS to .html; routes subdomains to their prefix",
+            functionName: `${namePrefix}-url-rewrite`,
+            comment: "Rewrites clean URLs to .html",
             code: cloudfront.FunctionCode.fromInline(`
-                var PREFIX_BY_HOST = ${JSON.stringify(prefixByHost)};
                 function handler(event) {
                     var request = event.request;
                     var uri = request.uri;
-                    
+
                     if (uri.endsWith('/')) {
                         uri += 'index.html'
                     } else if (!uri.includes('.')) {
                         uri += '.html';
                     }
-
-                    var host = request.headers.host && request.headers.host.value;
-                    var prefix = PREFIX_BY_HOST[host];
-                    if (prefix) {
-                        uri = prefix + uri;
-                    }
-
-                    // Stashed for the origin-request Lambda@Edge function below: by
-                    // the time that runs, CloudFront has already overwritten the Host
-                    // header with the origin's own hostname, so the viewer's original
-                    // host (and thus which environment's prefix applies) is otherwise
-                    // unrecoverable there. This custom header survives through only
-                    // because of the OriginRequestPolicy allow-listing it below.
-                    request.headers['x-env-prefix'] = { value: prefix || '' };
 
                     request.uri = uri;
                     return request;
@@ -124,59 +100,11 @@ export class StaticSite extends cdk.Stack {
             `),
         });
 
-        // CloudFront's custom-error-page fetch (below) re-requests responsePagePath
-        // directly from the origin — it does NOT go through the viewer-request
-        // CloudFront Function above, so a prefixed environment (e.g. preview/) would
-        // otherwise 403 fetching the unprefixed "/404.html" and CloudFront would
-        // surface S3's raw AccessDenied XML instead of the 404 page. CloudFront
-        // Functions can't run on the origin-request event, so this one piece needs
-        // Lambda@Edge instead. It can't key off the Host header itself — by the
-        // time origin-request runs, CloudFront has already overwritten Host with
-        // the origin's own hostname — so it reads the X-Env-Prefix header that
-        // rewriteFn stashed at viewer-request time instead (see the
-        // OriginRequestPolicy below, which is what makes that header survive
-        // through to here).
-        const errorPagePrefixFn = new cloudfront.experimental.EdgeFunction(
-            this,
-            "ErrorPagePrefixFunction",
-            {
-                functionName: `${config.slug}-error-page-prefix`,
-                runtime: lambda.Runtime.NODEJS_20_X,
-                handler: "index.handler",
-                code: lambda.Code.fromInline(`
-                    exports.handler = async (event) => {
-                        var request = event.Records[0].cf.request;
-                        if (request.uri === '/404.html') {
-                            var prefixHeader = request.headers['x-env-prefix'] && request.headers['x-env-prefix'][0];
-                            var prefix = prefixHeader && prefixHeader.value;
-                            if (prefix) {
-                                request.uri = prefix + request.uri;
-                            }
-                        }
-                        return request;
-                    };
-                `),
-            },
-        );
-
-        const forwardEnvPrefixHeader = new cloudfront.OriginRequestPolicy(
-            this,
-            "ForwardEnvPrefixHeader",
-            {
-                originRequestPolicyName: `${config.slug}-forward-env-prefix`,
-                comment:
-                    "Forwards the X-Env-Prefix header rewriteFn sets, so ErrorPagePrefixFunction can read it",
-                headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList(
-                    "X-Env-Prefix",
-                ),
-            },
-        );
-
         const distribution = new cloudfront.Distribution(
             this,
             "CloudFrontDistribution",
             {
-                comment: `${config.slug} static site`,
+                comment: `${config.slug} ${environment.name} static site`,
                 domainNames: domains,
                 certificate,
                 defaultRootObject: "index.html",
@@ -191,7 +119,6 @@ export class StaticSite extends cdk.Stack {
                         cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                     allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD,
                     cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
-                    originRequestPolicy: forwardEnvPrefixHeader,
                     responseHeadersPolicy:
                         cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
                     functionAssociations: [
@@ -200,13 +127,9 @@ export class StaticSite extends cdk.Stack {
                             eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
                         },
                     ],
-                    edgeLambdas: [
-                        {
-                            functionVersion: errorPagePrefixFn.currentVersion,
-                            eventType: cloudfront.LambdaEdgeEventType.ORIGIN_REQUEST,
-                        },
-                    ],
                 },
+                // Each environment's 404.html is at its own bucket's root, so the
+                // error-page fetch (which skips UrlRewriteFunction) just works.
                 errorResponses: [
                     {
                         httpStatus: 404,
@@ -227,42 +150,37 @@ export class StaticSite extends cdk.Stack {
         const dnsTarget = route53.RecordTarget.fromAlias(
             new targets.CloudFrontTarget(distribution),
         );
-        for (const environment of config.environments) {
-            const domain = environment.subdomain
-                ? `${environment.subdomain}.${config.domain}`
-                : config.domain;
-            const id =
-                environment.name.charAt(0).toUpperCase() + environment.name.slice(1);
-
-            new route53.ARecord(this, `${id}Record`, {
+        // Record ids are derived from the environment name, as in V1, so
+        // production's records keep their logical ids across the migration.
+        const recordId =
+            environment.name.charAt(0).toUpperCase() + environment.name.slice(1);
+        new route53.ARecord(this, `${recordId}Record`, {
+            zone,
+            recordName: environment.domain,
+            target: dnsTarget,
+        });
+        new route53.AaaaRecord(this, `${recordId}RecordIpv6`, {
+            zone,
+            recordName: environment.domain,
+            target: dnsTarget,
+        });
+        if (www) {
+            new route53.ARecord(this, `${recordId}WwwRecord`, {
                 zone,
-                recordName: domain,
+                recordName: `www.${environment.domain}`,
                 target: dnsTarget,
             });
-            new route53.AaaaRecord(this, `${id}RecordIpv6`, {
+            new route53.AaaaRecord(this, `${recordId}WwwRecordIpv6`, {
                 zone,
-                recordName: domain,
+                recordName: `www.${environment.domain}`,
                 target: dnsTarget,
             });
-
-            if (config.www && !environment.subdomain) {
-                new route53.ARecord(this, `${id}WwwRecord`, {
-                    zone,
-                    recordName: `www.${domain}`,
-                    target: dnsTarget,
-                });
-                new route53.AaaaRecord(this, `${id}WwwRecordIpv6`, {
-                    zone,
-                    recordName: `www.${domain}`,
-                    target: dnsTarget,
-                });
-            }
         }
 
         new cdk.CfnOutput(this, "BucketName", { value: bucket.bucketName });
         new cdk.CfnOutput(this, "DistributionId", {
             value: distribution.distributionId,
         });
-        new cdk.CfnOutput(this, "SiteUrl", { value: `https://${config.domain}` });
+        new cdk.CfnOutput(this, "SiteUrl", { value: `https://${environment.domain}` });
     }
 }

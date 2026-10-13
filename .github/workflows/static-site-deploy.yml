@@ -30,8 +30,8 @@ on:
       branch:
         description: >
           Branch to deploy. Matched against client.yaml's environments[].branch
-          to pick the target environment (production, preview, ...) — the key
-          prefix, subdomain, and stack it deploys to all follow from that
+          to pick the target environment (production, preview, ...) — the
+          subdomain, stack, and bucket it deploys to all follow from that
           environment. Defaults to the branch that triggered the run.
         required: false
         type: string
@@ -115,28 +115,23 @@ jobs:
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
           echo "dist=$DIST" >> "$GITHUB_OUTPUT"
 
-      # preview (and any other non-production) environments land under a
-      # <subdomain>/ key prefix in the same bucket, routed by the distribution's
-      # UrlRewriteFunction — see cloudbuilder's static-site.ts. Production
-      # (no subdomain) is unprefixed.
+      # Every environment has its own bucket and distribution, so content always
+      # lands at the bucket root.
       - name: Sync immutable assets
         env:
           BUCKET: ${{ steps.stack.outputs.bucket }}
-          PREFIX: ${{ steps.env.outputs.prefix }}
         run: |
-          aws s3 sync ./build/_app/immutable "s3://$BUCKET/${PREFIX}_app/immutable" \
+          aws s3 sync ./build/_app/immutable "s3://$BUCKET/_app/immutable" \
             --exclude '*.DS_Store' \
             --cache-control 'public,max-age=31536000,immutable'
 
       # Stable filenames must revalidate on every visit. --delete here so the bucket
-      # mirrors the build exactly. Scoped to the prefix so one environment's --delete
-      # never touches another's objects in the shared bucket.
+      # mirrors the build exactly.
       - name: Sync unversioned files
         env:
           BUCKET: ${{ steps.stack.outputs.bucket }}
-          PREFIX: ${{ steps.env.outputs.prefix }}
         run: |
-          aws s3 sync ./build "s3://$BUCKET/$PREFIX" \
+          aws s3 sync ./build "s3://$BUCKET/" \
             --delete \
             --exclude '_app/immutable/*' \
             --exclude '*.DS_Store' \
@@ -145,11 +140,10 @@ jobs:
       - name: Invalidate CloudFront
         env:
           DIST: ${{ steps.stack.outputs.dist }}
-          PREFIX: ${{ steps.env.outputs.prefix }}
         run: |
           aws cloudfront create-invalidation \
             --distribution-id "$DIST" \
-            --paths "/${PREFIX}" "/${PREFIX}index.html" "/${PREFIX}404.html" "/${PREFIX}version.json"
+            --paths "/" "/index.html" "/404.html" "/version.json"
 
       - name: Summary
         env:

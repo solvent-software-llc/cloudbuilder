@@ -31,10 +31,15 @@ if (configPath) {
             });
         }
     }
-    new StaticSite(app, config.aws.stackName, {
-        config,
-        env: { region: config.aws.region },
-        crossRegionReferences: false,
-    });
+    for (const environment of config.environments) {
+        if (!environment.site) continue;
+        new StaticSite(app, environment.site.stackName, {
+            config,
+            environment,
+            site: environment.site,
+            env: { region: config.aws.region },
+            crossRegionReferences: false,
+        });
+    }
 
 }

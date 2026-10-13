@@ -10,14 +10,17 @@ describe("load", () => {
         expect(config.domain).toBe("solventsoftware.com");
         expect(config.name).toBe("solvent software");
         expect(config.www).toBe(true);
-        expect(config.publicEnv).toStrictEqual({});
         expect(config.aws.region).toBe("us-east-1");
         expect(config.aws.hostedZoneId).toBe("HS1234");
-        expect(config.aws.stackName).toBe("solvent-software-site");
-        expect(config.aws.bucketName).toBe("solventsoftware.com-site");
         expect(config.environments).toEqual([
-            { name: "production", subdomain: undefined, branch: "main" },
+            {
+                name: "production",
+                subdomain: undefined,
+                branch: "main",
+                domain: "solventsoftware.com",
+            },
         ]);
+        expect(config.site).toBeUndefined();
         expect(config.github).toBeUndefined();
     });
     it("parses config with all values set", () => {
@@ -26,19 +29,75 @@ describe("load", () => {
         expect(config.domain).toBe("solventsoftware.com");
         expect(config.name).toBe("solvent software");
         expect(config.www).toBe(false);
-        expect(config.publicEnv).toStrictEqual({ PUBLIC_KEY: "value" });
+        expect(config.site).toStrictEqual({ publicEnv: { PUBLIC_KEY: "value" } });
         expect(config.aws.region).toBe("us-east-1");
         expect(config.aws.hostedZoneId).toBe("HS1234");
-        expect(config.aws.stackName).toBe("custom-stack");
-        expect(config.aws.bucketName).toBe("custom-bucket");
         expect(config.environments).toEqual([
-            { name: "production", subdomain: undefined, branch: "main" },
-            { name: "preview build", subdomain: "preview", branch: "dev" },
+            {
+                name: "production",
+                subdomain: undefined,
+                branch: "main",
+                domain: "solventsoftware.com",
+                site: { stackName: "custom-stack", bucketName: "custom-bucket" },
+            },
+            {
+                name: "preview build",
+                subdomain: "preview",
+                branch: "dev",
+                domain: "preview.solventsoftware.com",
+                site: {
+                    stackName: "solvent-software-preview-site",
+                    bucketName: "solvent-software-preview-site",
+                },
+            },
         ]);
         expect(config.github).toEqual({
             org: "solvent-software-llc",
             repos: ["solvent-software-site"],
         });
+    });
+    it("derives site names when site is an empty block", () => {
+        const config = load(fixture("site-defaults"));
+        expect(config.site).toStrictEqual({ publicEnv: {} });
+        expect(config.environments.map((e) => e.site)).toEqual([
+            { stackName: "solvent-software-site", bucketName: "solventsoftware.com-site" },
+            {
+                stackName: "solvent-software-preview-site",
+                bucketName: "solvent-software-preview-site",
+            },
+        ]);
+    });
+    it("prefers per-environment site names over site.* and defaults", () => {
+        const config = load(fixture("env-overrides"));
+        expect(config.environments.map((e) => e.site)).toEqual([
+            { stackName: "prod-stack", bucketName: "prod-bucket" },
+            { stackName: "staging-stack", bucketName: "staging-bucket" },
+        ]);
+    });
+    it("throws on V1 keys that moved under site", () => {
+        expect(() => load(fixture("v1-keys"))).toThrow(
+            /"aws.bucket_name" moved to "site.bucket_name"/,
+        );
+    });
+    it("throws when an environment sets site without a top-level site block", () => {
+        expect(() => load(fixture("env-site-without-site"))).toThrow(
+            /environments\[\]\.site is set .* no top-level site block/,
+        );
+    });
+    it("throws when more than one environment has no subdomain", () => {
+        expect(() => load(fixture("two-production"))).toThrow(
+            /more than one environment has no subdomain/,
+        );
+    });
+    it("throws when two environments share a subdomain", () => {
+        expect(() => load(fixture("duplicate-subdomain"))).toThrow(
+            /subdomain "preview" is used by more than one environment/,
+        );
+    });
+    it("throws when two environments share a bucket name", () => {
+        expect(() => load(fixture("duplicate-bucket"))).toThrow(
+            /bucket name "shared-bucket" is used by more than one environment/,
+        );
     });
     it("throws on missing required value", () => {
         expect(() => load(fixture("missing-slug"))).toThrow(
@@ -60,10 +119,11 @@ describe("load", () => {
 describe("resolveEnvironment", () => {
     it("finds the environment matching a branch", () => {
         const config = load(fixture("all-values"));
-        expect(resolveEnvironment(config, "dev")).toEqual({
+        expect(resolveEnvironment(config, "dev")).toMatchObject({
             name: "preview build",
             subdomain: "preview",
             branch: "dev",
+            site: { stackName: "solvent-software-preview-site" },
         });
     });
     it("throws when no environment matches the branch", () => {
