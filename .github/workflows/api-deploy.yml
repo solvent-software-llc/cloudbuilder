@@ -118,11 +118,24 @@ jobs:
           aws-region: ${{ steps.env.outputs.region }}
           role-skip-session-tagging: true
 
+      # Maintenance mode is switched only by api-maintenance.yml. Passing the
+      # live state into the deploy keeps the template's route target matching
+      # it, so CloudFormation never quietly flips it back mid-incident.
+      - name: Read maintenance state
+        id: maintenance
+        working-directory: .cloudbuilder
+        env:
+          STACK: ${{ steps.env.outputs.stack }}
+        run: |
+          STATE=$(bin/api-maintenance.sh status)
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+
       - name: Deploy infrastructure
         working-directory: .cloudbuilder
         env:
           CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
           API_BUILD_DIR: ${{ steps.build.outputs.dir }}
+          API_MAINTENANCE: ${{ steps.maintenance.outputs.state }}
           STACK: ${{ steps.env.outputs.stack }}
         run: npx cdk deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json
 
@@ -146,9 +159,14 @@ jobs:
           URL: ${{ steps.stack.outputs.url }}
           STACK: ${{ steps.env.outputs.stack }}
           FN: ${{ steps.stack.outputs.function }}
+          MAINTENANCE: ${{ steps.maintenance.outputs.state }}
         run: |
           {
             echo "### Deployed $ENVIRONMENT API to $URL"
             echo "- Stack: \`$STACK\`"
             echo "- Function: \`$FN\`"
+            echo "- Maintenance: $MAINTENANCE"
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MAINTENANCE" = on ]; then
+            echo "::warning::$ENVIRONMENT API is still in maintenance mode; turn it off with the API maintenance workflow once verified"
+          fi

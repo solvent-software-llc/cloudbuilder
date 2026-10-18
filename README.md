@@ -10,8 +10,10 @@ A CDK app (`bin/app.ts`) that defines three kinds of stacks:
   `client.yaml` file and only synthesized when `CONFIG_PATH` is set.
 - a per-environment API stack (`src/api.ts`) — a Go Lambda behind an API
   Gateway HTTP API at `api.<environment domain>`, with its own regional
-  certificate and Route53 records. Only synthesized when `client.yaml` has an
-  `api:` block (normally only the API repo's). See "Deploying an API" below.
+  certificate and Route53 records, plus a maintenance function the route can
+  be switched to. Only synthesized when `client.yaml` has an `api:` block
+  (normally only the API repo's). See "Deploying an API" and "API maintenance
+  mode" below.
 - a per-repo GitHub deploy-role stack (`src/github-deploy-role.ts`) — an
   IAM role a client's GitHub Actions workflow can assume via the OIDC
   provider to deploy that client's site stack. One is synthesized per
@@ -179,6 +181,94 @@ hand without a build. To deploy one manually:
 ```
 (cd <api module> && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o /tmp/api-build/bootstrap ./cmd/lambda)
 CONFIG_PATH=path/to/client.yaml API_BUILD_DIR=/tmp/api-build npx cdk deploy <slug>-api
+```
+
+A hand-run deploy turns maintenance mode **off** unless you also pass
+`API_MAINTENANCE=on` (check first with `STACK=<stack> bin/api-maintenance.sh
+status`). See below.
+
+## API maintenance mode
+
+Every API stack also deploys a small maintenance function. Maintenance mode
+points the API's `$default` route at it instead of the Go function, so every
+request to `api.<domain>` gets the maintenance response. The site itself keeps
+loading from CloudFront; only its API calls are affected.
+
+### The maintenance response
+
+Clients (the site, the mobile app) should treat this as "we'll be right back",
+not as a generic error:
+
+```
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Cache-Control: no-store
+Retry-After: 60
+Access-Control-Allow-Origin: <the requesting site origin, if allowed>
+Access-Control-Allow-Credentials: true
+Access-Control-Expose-Headers: Retry-After
+
+{"maintenance": true}
+```
+
+- Detect it by the `{"maintenance": true}` body, not the 503 alone: other
+  failures can also be 503s.
+- CORS preflights (`OPTIONS`) are answered with `204` and the usual CORS
+  headers for allowed origins, so a browser's real request still goes out and
+  receives the 503 instead of failing as a network error.
+- While in maintenance, every route returns this, including a health
+  endpoint, so a client can poll any cheap endpoint every `Retry-After`
+  seconds (plus some jitter) and resume when it stops getting it.
+
+### Switching it on and off
+
+The API repo adds a manual workflow calling `api-maintenance.yml`:
+
+```yaml
+name: API maintenance
+on:
+  workflow_dispatch:
+    inputs:
+      state:
+        type: choice
+        options: ["on", "off"]
+jobs:
+  maintenance:
+    uses: solvent-software-llc/cloudbuilder/.github/workflows/api-maintenance.yml@v2
+    with:
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      cloudbuilder-ref: v2
+      state: ${{ inputs.state }}
+```
+
+Run it from the branch of the environment to switch (e.g. `main` for
+production): the branch picks the environment, the same way it does for
+`api-deploy.yml`, and must be one of `environments[].branch` for the deploy
+role to trust the run. The switch takes effect within seconds; no `cdk
+deploy` is involved.
+
+`api-deploy.yml` reads the current state before deploying and keeps it, so
+**deploys never turn maintenance on or off** — only this workflow does. A
+deploy made while maintenance is on finishes with a warning saying so.
+
+Typical uses:
+
+- **Shipping code and a schema change together:** turn maintenance on,
+  deploy, check the new code directly (below), turn maintenance off.
+- **A major bug:** turn maintenance on immediately, deploy fixes as many times
+  as needed, check, turn maintenance off.
+
+### Checking the new code while in maintenance
+
+`api.<domain>` only returns the maintenance response while maintenance is on,
+so call the function directly with your own AWS credentials. `FunctionName` is
+an API stack output. Adjust the event to whatever your Go adapter requires:
+
+```
+aws lambda invoke --function-name <FunctionName> \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"version":"2.0","routeKey":"$default","rawPath":"/healthz","rawQueryString":"","headers":{},"requestContext":{"http":{"method":"GET","path":"/healthz"}},"isBase64Encoded":false}' \
+  /dev/stdout
 ```
 
 ## Updating an existing client

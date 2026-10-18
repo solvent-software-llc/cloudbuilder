@@ -1,0 +1,118 @@
+name: API maintenance
+
+# Turns an environment's API maintenance mode on or off by pointing its
+# $default route at the maintenance function or back at the Go function (see
+# bin/api-maintenance.sh). No `cdk deploy`: it takes effect within seconds.
+# api-deploy.yml reads this state and preserves it, so deploys made while
+# maintenance is on stay behind the maintenance response until it's turned
+# off here.
+
+on:
+  workflow_call:
+    inputs:
+      aws-role-arn:
+        description: IAM role ARN for the client account (from the github-deploy-role stack output)
+        required: true
+        type: string
+      state:
+        description: '"on" or "off"'
+        required: true
+        type: string
+      config-path:
+        description: Path to client.yaml in the calling repo
+        required: false
+        type: string
+        default: client.yaml
+      node-version:
+        description: Node version for running cloudbuilder's environment resolver
+        required: false
+        type: string
+        default: '22'
+      cloudbuilder-ref:
+        description: >
+          The ref/tag of THIS reusable workflow that the caller pinned in its
+          own `uses: .../api-maintenance.yml@X` line (e.g. "v2"). See
+          api-deploy.yml.
+        required: true
+        type: string
+      branch:
+        description: >
+          Branch whose environment to switch, matched against client.yaml's
+          environments[].branch like api-deploy.yml. Defaults to the branch
+          the run was started from, which must also be one the deploy role
+          trusts.
+        required: false
+        type: string
+        default: ${{ github.ref_name }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  switch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate state
+        env:
+          STATE: ${{ inputs.state }}
+        run: |
+          if [ "$STATE" != on ] && [ "$STATE" != off ]; then
+            echo "::error::state must be \"on\" or \"off\", got \"$STATE\""; exit 1
+          fi
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Checkout cloudbuilder
+        uses: actions/checkout@v4
+        with:
+          repository: solvent-software-llc/cloudbuilder
+          ref: ${{ inputs.cloudbuilder-ref }}
+          path: .cloudbuilder
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: .cloudbuilder/package-lock.json
+
+      - name: Install cloudbuilder dependencies
+        working-directory: .cloudbuilder
+        run: npm ci
+
+      - name: Resolve environment
+        id: env
+        working-directory: .cloudbuilder
+        env:
+          CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
+          BRANCH: ${{ inputs.branch }}
+          TARGET: api
+        run: npx ts-node bin/resolve-env.ts
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ steps.env.outputs.region }}
+          role-skip-session-tagging: true
+
+      - name: Switch maintenance ${{ inputs.state }}
+        id: switch
+        working-directory: .cloudbuilder
+        env:
+          STACK: ${{ steps.env.outputs.stack }}
+          STATE: ${{ inputs.state }}
+        run: |
+          RESULT=$(bin/api-maintenance.sh "$STATE")
+          echo "state=$RESULT" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          ENVIRONMENT: ${{ steps.env.outputs.environment }}
+          DOMAIN: ${{ steps.env.outputs.api-domain }}
+          STATE: ${{ steps.switch.outputs.state }}
+        run: |
+          echo "### $ENVIRONMENT API maintenance is $STATE (https://$DOMAIN)" >> "$GITHUB_STEP_SUMMARY"

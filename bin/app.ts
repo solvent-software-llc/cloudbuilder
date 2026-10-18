@@ -42,6 +42,13 @@ if (configPath) {
             crossRegionReferences: false,
         });
     }
+    // Set by api-deploy.yml from the live route (bin/api-maintenance.sh
+    // status). Unset means off, so a hand-run `cdk deploy` of an API stack
+    // that's in maintenance takes it out of maintenance.
+    const apiMaintenance = process.env.API_MAINTENANCE ?? "off";
+    if (apiMaintenance !== "on" && apiMaintenance !== "off") {
+        throw new Error(`API_MAINTENANCE must be "on" or "off", got "${apiMaintenance}"`);
+    }
     for (const environment of config.environments) {
         if (!config.api || !environment.api) continue;
         new Api(app, environment.api.stackName, {
@@ -50,6 +57,7 @@ if (configPath) {
             environment,
             api: environment.api,
             buildDir: process.env.API_BUILD_DIR,
+            maintenance: apiMaintenance === "on",
             env: { region: config.aws.region },
         });
     }

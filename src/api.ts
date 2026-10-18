@@ -21,9 +21,14 @@ export interface ApiProps extends cdk.StackProps {
     // deploy workflow. Undefined outside a real deploy (cdk ls, synthesizing
     // other stacks) — see the placeholder handling below.
     buildDir?: string;
+    // Whether the $default route targets the maintenance function. The deploy
+    // workflow reads the live route and passes its state through, so a deploy
+    // never turns maintenance on or off — only api-maintenance.yml does.
+    maintenance: boolean;
 }
 
 const PLACEHOLDER_DIR = path.join(__dirname, "..", "assets", "api-placeholder");
+const MAINTENANCE_DIR = path.join(__dirname, "..", "assets", "api-maintenance");
 
 // One stack per environment: a Go Lambda behind an HTTP API on its own
 // hostname, api.<environment domain>. The site stacks know nothing about it.
@@ -35,7 +40,7 @@ export class Api extends cdk.Stack {
     constructor(scope: Construct, id: string, props: ApiProps) {
         super(scope, id, props);
 
-        const { config, apiConfig, environment, api, buildDir } = props;
+        const { config, apiConfig, environment, api, buildDir, maintenance } = props;
         const zone = route53.HostedZone.fromHostedZoneAttributes(this, "Zone", {
             hostedZoneId: config.aws.hostedZoneId,
             zoneName: config.domain,
@@ -62,6 +67,7 @@ export class Api extends cdk.Stack {
             config.www && !environment.subdomain
                 ? [environment.domain, `www.${environment.domain}`]
                 : [environment.domain];
+        const allowedOrigins = siteHosts.map((host) => `https://${host}`).join(",");
 
         // Secrets reach the function as parameter NAMES; it reads the values at
         // runtime through the Parameters and Secrets extension, so they never
@@ -91,7 +97,7 @@ export class Api extends cdk.Stack {
             environment: {
                 ...api.env,
                 ...secretParamEnv,
-                ALLOWED_ORIGINS: siteHosts.map((host) => `https://${host}`).join(","),
+                ALLOWED_ORIGINS: allowedOrigins,
                 ENVIRONMENT: environment.name,
                 API_DOMAIN: api.domain,
             },
@@ -143,6 +149,55 @@ export class Api extends cdk.Stack {
             disableExecuteApiEndpoint: true,
         });
 
+        // Maintenance mode: a second, always-deployed function that answers
+        // every request with a 503 (assets/api-maintenance/index.mjs), and its
+        // own integration. Switching the $default route between the two
+        // integrations is the on/off switch; see README's "API maintenance
+        // mode" and bin/api-maintenance.sh.
+        const maintenanceLogGroup = new logs.LogGroup(this, "MaintenanceLogs", {
+            retention: logs.RetentionDays.ONE_MONTH,
+            removalPolicy: cdk.RemovalPolicy.DESTROY,
+        });
+        const maintenanceFn = new lambda.Function(this, "MaintenanceFunction", {
+            description: `${config.slug} ${environment.name} API maintenance response`,
+            runtime: lambda.Runtime.NODEJS_22_X,
+            architecture: lambda.Architecture.ARM_64,
+            handler: "index.handler",
+            code: lambda.Code.fromAsset(MAINTENANCE_DIR),
+            memorySize: 128,
+            timeout: cdk.Duration.seconds(3),
+            logGroup: maintenanceLogGroup,
+            environment: { ALLOWED_ORIGINS: allowedOrigins },
+        });
+        const maintenanceIntegration = new apigwv2.HttpIntegration(this, "MaintenanceIntegration", {
+            httpApi,
+            integrationType: apigwv2.HttpIntegrationType.AWS_PROXY,
+            integrationUri: maintenanceFn.functionArn,
+            payloadFormatVersion: apigwv2.PayloadFormatVersion.VERSION_2_0,
+        });
+        // Same source ARN HttpLambdaIntegration grants the main function.
+        maintenanceFn.addPermission("ApiGatewayInvoke", {
+            principal: new iam.ServicePrincipal("apigateway.amazonaws.com"),
+            sourceArn: this.formatArn({
+                service: "execute-api",
+                resource: httpApi.apiId,
+                resourceName: "*/*",
+            }),
+        });
+
+        // The route and the function's integration come from defaultIntegration
+        // above, and are looked up rather than built by hand so their logical
+        // ids stay put: replacing the route would make CloudFormation create a
+        // second $default route before deleting the first, which fails.
+        const defaultRoute = httpApi.node.findChild("DefaultRoute") as apigwv2.HttpRoute;
+        const functionIntegration = defaultRoute.node.findChild(
+            "FunctionIntegration",
+        ) as apigwv2.HttpIntegration;
+        if (maintenance) {
+            (defaultRoute.node.defaultChild as apigwv2.CfnRoute).target =
+                `integrations/${maintenanceIntegration.integrationId}`;
+        }
+
         const dnsTarget = route53.RecordTarget.fromAlias(
             new targets.ApiGatewayv2DomainProperties(
                 domainName.regionalDomainName,
@@ -163,5 +218,13 @@ export class Api extends cdk.Stack {
         new cdk.CfnOutput(this, "ApiUrl", { value: `https://${api.domain}` });
         new cdk.CfnOutput(this, "FunctionName", { value: fn.functionName });
         new cdk.CfnOutput(this, "HttpApiId", { value: httpApi.apiId });
+        // Read by bin/api-maintenance.sh to find and switch the route.
+        new cdk.CfnOutput(this, "DefaultRouteId", { value: defaultRoute.routeId });
+        new cdk.CfnOutput(this, "FunctionIntegrationId", {
+            value: functionIntegration.integrationId,
+        });
+        new cdk.CfnOutput(this, "MaintenanceIntegrationId", {
+            value: maintenanceIntegration.integrationId,
+        });
     }
 }

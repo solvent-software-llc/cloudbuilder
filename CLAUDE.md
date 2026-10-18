@@ -198,6 +198,18 @@ that directory to the CDK app as `API_BUILD_DIR`. `src/api.ts` falls back to
 `cdk ls` and synthesizing other stacks keep working without a Go build —
 don't turn that annotation into a thrown error.
 
+`.github/workflows/api-maintenance.yml` switches an API's maintenance mode by
+changing its `$default` route's target outside CloudFormation
+(`bin/api-maintenance.sh`). That is deliberate drift, and the reason
+`api-deploy.yml` reads the live route first and passes it to the CDK app as
+`API_MAINTENANCE`: if the template's route target didn't match the live one,
+any deploy that touched the route would quietly end maintenance in the middle
+of an incident. The route and its function integration come from
+`HttpApi`'s `defaultIntegration` and are looked up with `findChild` in
+`src/api.ts` rather than built by hand, so their logical ids stay put —
+replacing the route would make CloudFormation create a second `$default` route
+before deleting the first, which fails.
+
 There is currently no equivalent `static-site-validate.yml` (a no-AWS-writes
 version for PR checks) — client repos still relying on the old
 `workflows`-repo validator will find it rejects `client.yaml`'s current

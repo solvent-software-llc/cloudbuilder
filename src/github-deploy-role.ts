@@ -20,6 +20,7 @@ export class GithubDeployRole extends cdk.Stack {
         // it's added to client.yaml.
         const branches = config.environments.map((e) => e.branch);
         const sites = config.environments.flatMap((e) => (e.site ? [e.site] : []));
+        const hasApi = config.environments.some((e) => e.api);
         const stackNames = config.environments.flatMap((e) => [
             ...(e.site ? [e.site.stackName] : []),
             ...(e.api ? [e.api.stackName] : []),
@@ -130,6 +131,19 @@ export class GithubDeployRole extends cdk.Stack {
                                     `arn:aws:s3:::${site.bucketName}`,
                                     `arn:aws:s3:::${site.bucketName}/*`,
                                 ]),
+                            },
+                            ]),
+                            ...(!hasApi ? [] : [
+                            {
+                                // bin/api-maintenance.sh reads and switches the API
+                                // stacks' $default route target directly as this role.
+                                // The API ids are generated at stack creation, after
+                                // this role exists, so this is scoped to routes of any
+                                // HTTP API in the region rather than specific APIs.
+                                Sid: "ApiMaintenance",
+                                Effect: "Allow",
+                                Action: ["apigateway:GET", "apigateway:PATCH"],
+                                Resource: `arn:aws:apigateway:${this.region}::/apis/*/routes/*`,
                             },
                             ]),
                             {
