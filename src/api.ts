@@ -3,6 +3,7 @@ import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as triggers from "aws-cdk-lib/triggers";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
@@ -21,6 +22,8 @@ export interface ApiProps extends cdk.StackProps {
     // deploy workflow. Undefined outside a real deploy (cdk ls, synthesizing
     // other stacks) — see the placeholder handling below.
     buildDir?: string;
+    // Same, for the migration binary when api.migrate is set.
+    migrateBuildDir?: string;
     // Whether the $default route targets the maintenance function. The deploy
     // workflow reads the live route and passes its state through, so a deploy
     // never turns maintenance on or off — only api-maintenance.yml does.
@@ -40,25 +43,35 @@ export class Api extends cdk.Stack {
     constructor(scope: Construct, id: string, props: ApiProps) {
         super(scope, id, props);
 
-        const { config, apiConfig, environment, api, buildDir, maintenance } = props;
+        const { config, apiConfig, environment, api, buildDir, migrateBuildDir, maintenance } =
+            props;
         const zone = route53.HostedZone.fromHostedZoneAttributes(this, "Zone", {
             hostedZoneId: config.aws.hostedZoneId,
             zoneName: config.domain,
         });
 
-        let codeDir = PLACEHOLDER_DIR;
-        if (buildDir) {
-            if (!fs.existsSync(path.join(buildDir, "bootstrap"))) {
-                throw new Error(`API_BUILD_DIR "${buildDir}" has no bootstrap binary`);
+        const codeDir = (dir: string | undefined, envVar: string) => {
+            if (!dir) {
+                // An error annotation fails `cdk deploy`/`cdk synth` of this stack
+                // only, so the rest of the app still synthesizes without a build.
+                cdk.Annotations.of(this).addError(
+                    `${envVar} is not set, so this stack has no Lambda code to deploy`,
+                );
+                return PLACEHOLDER_DIR;
             }
-            codeDir = buildDir;
-        } else {
-            // An error annotation fails `cdk deploy`/`cdk synth` of this stack
-            // only, so the rest of the app still synthesizes without a build.
-            cdk.Annotations.of(this).addError(
-                "API_BUILD_DIR is not set, so this stack has no Lambda code to deploy",
-            );
-        }
+            if (!fs.existsSync(path.join(dir, "bootstrap"))) {
+                throw new Error(`${envVar} "${dir}" has no bootstrap binary`);
+            }
+            return dir;
+        };
+        const architecture =
+            apiConfig.architecture === "arm64"
+                ? lambda.Architecture.ARM_64
+                : lambda.Architecture.X86_64;
+        const paramsAndSecrets = lambda.ParamsAndSecretsLayerVersion.fromVersion(
+            lambda.ParamsAndSecretsVersions.V1_0_103,
+            { parameterStoreTtl: cdk.Duration.minutes(5) },
+        );
 
         // Exact origins only (no wildcard): the site serves the same hostnames
         // as this environment, plus www for production. Domains always match
@@ -84,13 +97,10 @@ export class Api extends cdk.Stack {
         const fn = new lambda.Function(this, "Function", {
             description: `${config.slug} ${environment.name} API`,
             runtime: lambda.Runtime.PROVIDED_AL2023,
-            architecture:
-                apiConfig.architecture === "arm64"
-                    ? lambda.Architecture.ARM_64
-                    : lambda.Architecture.X86_64,
+            architecture,
             // provided.* runtimes ignore the handler; the binary is `bootstrap`.
             handler: "bootstrap",
-            code: lambda.Code.fromAsset(codeDir),
+            code: lambda.Code.fromAsset(codeDir(buildDir, "API_BUILD_DIR")),
             memorySize: apiConfig.memoryMb,
             timeout: cdk.Duration.seconds(apiConfig.timeoutSeconds),
             logGroup,
@@ -101,28 +111,68 @@ export class Api extends cdk.Stack {
                 ENVIRONMENT: environment.name,
                 API_DOMAIN: api.domain,
             },
-            paramsAndSecrets: lambda.ParamsAndSecretsLayerVersion.fromVersion(
-                lambda.ParamsAndSecretsVersions.V1_0_103,
-                { parameterStoreTtl: cdk.Duration.minutes(5) },
-            ),
+            paramsAndSecrets,
         });
+        const secretReaders: lambda.Function[] = [fn];
+
+        // Migrations: a second Go binary that CloudFormation invokes once per
+        // deploy (whenever its code changes) through a CDK trigger, before the
+        // API function is updated. It gets the same env and secrets, so it
+        // reaches the same database. A returned error fails the deploy and
+        // CloudFormation rolls the stack back, leaving the old API code
+        // serving — but it can't roll the schema back, so migrations must
+        // work with the code already running. See README's "Database
+        // migrations".
+        if (apiConfig.migrate) {
+            const migrateFn = new lambda.Function(this, "MigrateFunction", {
+                description: `${config.slug} ${environment.name} API migrations`,
+                runtime: lambda.Runtime.PROVIDED_AL2023,
+                architecture,
+                handler: "bootstrap",
+                code: lambda.Code.fromAsset(codeDir(migrateBuildDir, "API_MIGRATE_BUILD_DIR")),
+                memorySize: apiConfig.memoryMb,
+                timeout: cdk.Duration.seconds(apiConfig.migrate.timeoutSeconds),
+                logGroup: new logs.LogGroup(this, "MigrateLogs", {
+                    retention: logs.RetentionDays.ONE_MONTH,
+                    removalPolicy: cdk.RemovalPolicy.DESTROY,
+                }),
+                environment: {
+                    ...api.env,
+                    ...secretParamEnv,
+                    ENVIRONMENT: environment.name,
+                },
+                paramsAndSecrets,
+            });
+            secretReaders.push(migrateFn);
+            // Not TriggerFunction: it uses one `timeout` for both the function
+            // and the trigger's wait on it, so the wait could give up just as
+            // a slow migration finishes. The trigger provider is a Lambda
+            // capped at 15 minutes, hence config.ts's 10-minute migrate cap.
+            new triggers.Trigger(this, "MigrateTrigger", {
+                handler: migrateFn,
+                timeout: cdk.Duration.seconds(apiConfig.migrate.timeoutSeconds + 60),
+                executeBefore: [fn],
+            });
+        }
 
         // SecureStrings encrypted with the AWS-managed aws/ssm key need no
         // kms:Decrypt grant: that key's policy already allows decryption via
         // SSM for any principal in the account allowed to call GetParameter.
         const parameterNames = [...new Set(Object.values(api.secrets))];
         if (parameterNames.length > 0) {
-            fn.addToRolePolicy(
-                new iam.PolicyStatement({
-                    actions: ["ssm:GetParameter"],
-                    // Names are validated as hierarchical (leading "/"), so the
-                    // ARN is just parameter<name>.
-                    resources: parameterNames.map(
-                        (name) =>
-                            `arn:aws:ssm:${this.region}:${this.account}:parameter${name}`,
-                    ),
-                }),
-            );
+            for (const reader of secretReaders) {
+                reader.addToRolePolicy(
+                    new iam.PolicyStatement({
+                        actions: ["ssm:GetParameter"],
+                        // Names are validated as hierarchical (leading "/"), so the
+                        // ARN is just parameter<name>.
+                        resources: parameterNames.map(
+                            (name) =>
+                                `arn:aws:ssm:${this.region}:${this.account}:parameter${name}`,
+                        ),
+                    }),
+                );
+            }
         }
 
         // Regional cert: an HTTP API custom domain needs its cert in the API's

@@ -58,6 +58,8 @@ if (target === "api") {
         "api-domain": environment.api.domain,
         module: config.api.module,
         main: config.api.main,
+        // Empty when api.migrate isn't set, which skips the migrate build.
+        migrate: config.api.migrate?.main ?? "",
         // Go's GOARCH spelling of the Lambda architecture.
         goarch: config.api.architecture === "arm64" ? "arm64" : "amd64",
     });

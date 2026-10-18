@@ -52,6 +52,12 @@ export interface Config {
         architecture: "arm64" | "x86_64";
         memoryMb: number;
         timeoutSeconds: number;
+        // Migration package, relative to module. When set, each API stack runs
+        // it as a deploy-time trigger before updating the API function.
+        migrate?: {
+            main: string;
+            timeoutSeconds: number;
+        };
     };
     github?: {
         org: string;
@@ -79,6 +85,16 @@ const RESERVED_ENV_PREFIXES = [
 const SSM_NAME_RE = /^(\/[A-Za-z0-9_.-]+)+$/;
 // API Gateway HTTP API caps integration timeouts at 30s.
 const MAX_API_TIMEOUT_SECONDS = 30;
+// Lambda allows 15 minutes, but the trigger provider that waits on the
+// migration is itself a Lambda capped at 15 minutes, and needs headroom.
+const MAX_MIGRATE_TIMEOUT_SECONDS = 600;
+
+function parsePackagePath(raw: unknown, where: string): string {
+    if (typeof raw !== "string" || !raw.startsWith("./") || raw.split("/").includes("..")) {
+        throw new Error(`client.yaml: ${where} "${raw}" must be a package path like "./cmd/lambda", relative to api.module`);
+    }
+    return raw;
+}
 
 function parseEnvKeys(raw: unknown, where: string): [string, unknown][] {
     if (raw === undefined) return [];
@@ -184,9 +200,20 @@ export function load(path: string): Config {
         if (rawApi.module.startsWith("/") || rawApi.module.split("/").includes("..")) {
             throw new Error(`client.yaml: api.module "${rawApi.module}" must be a path inside the repo`);
         }
-        const main = rawApi.main ?? "./cmd/lambda";
-        if (typeof main !== "string" || !main.startsWith("./") || main.split("/").includes("..")) {
-            throw new Error(`client.yaml: api.main "${main}" must be a package path like "./cmd/lambda", relative to api.module`);
+        const main = parsePackagePath(rawApi.main ?? "./cmd/lambda", "api.main");
+        let migrate: NonNullable<Config["api"]>["migrate"];
+        if (rawApi.migrate !== undefined) {
+            migrate = {
+                main: parsePackagePath(rawApi.migrate, "api.migrate"),
+                timeoutSeconds: parseIntInRange(
+                    rawApi.migrate_timeout, 300, 1, MAX_MIGRATE_TIMEOUT_SECONDS, "api.migrate_timeout",
+                ),
+            };
+            if (migrate.main === main) {
+                throw new Error(`client.yaml: api.migrate must be a different package from api.main`);
+            }
+        } else if (rawApi.migrate_timeout !== undefined) {
+            throw new Error(`client.yaml: api.migrate_timeout is set but api.migrate is not`);
         }
         const architecture = rawApi.architecture ?? "arm64";
         if (architecture !== "arm64" && architecture !== "x86_64") {
@@ -200,6 +227,7 @@ export function load(path: string): Config {
             timeoutSeconds: parseIntInRange(
                 rawApi.timeout, 10, 1, MAX_API_TIMEOUT_SECONDS, "api.timeout",
             ),
+            migrate,
         };
     }
 

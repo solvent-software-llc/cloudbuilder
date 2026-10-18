@@ -58,6 +58,8 @@ stack rather than creating a new one.
 | `api`                   | no       | Go API settings. **API stacks are synthesized only if this block is present** — normally only in the API repo's `client.yaml`. Each enabled environment gets an API at `api.<environment domain>`. |
 | `api.module`            | yes*     | Directory containing `go.mod`, relative to the repo root. Required if `api` is set. |
 | `api.main`              | no       | Package to build, relative to `api.module`. Defaults to `./cmd/lambda`.     |
+| `api.migrate`           | no       | Migration package to build, relative to `api.module` (e.g. `./cmd/migrate`). When set, every deploy runs it before updating the API. See "Database migrations". |
+| `api.migrate_timeout`   | no       | Migration timeout in seconds, 1–600. Defaults to `300`. Only valid with `api.migrate`. |
 | `api.architecture`      | no       | `arm64` (default) or `x86_64`.                                              |
 | `api.memory`            | no       | Lambda memory in MB, 128–10240. Defaults to `256`.                          |
 | `api.timeout`           | no       | Lambda timeout in seconds, 1–30 (API Gateway's integration cap). Defaults to `10`. |
@@ -183,9 +185,67 @@ hand without a build. To deploy one manually:
 CONFIG_PATH=path/to/client.yaml API_BUILD_DIR=/tmp/api-build npx cdk deploy <slug>-api
 ```
 
+With `api.migrate` set, also build the migration package into its own
+directory and pass it as `API_MIGRATE_BUILD_DIR`.
+
 A hand-run deploy turns maintenance mode **off** unless you also pass
 `API_MAINTENANCE=on` (check first with `STACK=<stack> bin/api-maintenance.sh
 status`). See below.
+
+## Database migrations
+
+With `api.migrate` set, `api-deploy.yml` builds that package into a second
+`bootstrap` binary, and the API stack runs it as a Lambda that CloudFormation
+calls during `cdk deploy` (a CDK trigger), **before** it updates the API
+function. It gets the same `env`, `secrets`, and `ENVIRONMENT` as the API, so
+it reaches the same database.
+
+The binary is an ordinary Lambda handler that applies pending migrations and
+returns an error if any fail. It's invoked with an empty payload. For example,
+with goose and migrations embedded in the binary:
+
+```go
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+func handler(ctx context.Context) error {
+    db, err := openDB(ctx) // e.g. DATABASE_URL_PARAM via the secrets extension
+    if err != nil {
+        return err
+    }
+    defer db.Close()
+    goose.SetBaseFS(migrations)
+    if err := goose.SetDialect("postgres"); err != nil {
+        return err
+    }
+    return goose.UpContext(ctx, db, "migrations")
+}
+
+func main() { lambda.Start(handler) }
+```
+
+How it behaves:
+
+- **When it runs:** on a deploy where the migration binary changed. Embedding
+  the migrations means adding one changes the binary. A deploy that changes
+  only API code may skip it, which is fine because there's nothing new to
+  apply. Migrations must be idempotent (goose and golang-migrate skip
+  versions already applied).
+- **On failure:** the deploy fails and CloudFormation rolls the stack back,
+  so the old API code keeps serving. The schema is **not** rolled back:
+  whatever the migration already applied stays.
+- **Write migrations the old code can live with:** add columns and tables
+  first; drop or rename them in a later deploy, once no running code uses
+  them. When a change can't be made compatible, turn on maintenance mode
+  (below) before deploying, so no old code serves the new schema.
+- **Environments sharing a database:** every environment with an API runs
+  its migrations on deploy. If preview and production point at the same
+  database, a preview deploy migrates production's schema.
+- **Not on hotswap:** `cdk deploy --hotswap` / `cdk watch` update code without
+  going through CloudFormation, so migrations don't run.
+
+Output goes to the stack's `MigrateLogs` log group. A failed run's error also
+appears in the CloudFormation events for the `MigrateTrigger` resource.
 
 ## API maintenance mode
 

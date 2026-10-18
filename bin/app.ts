@@ -57,6 +57,7 @@ if (configPath) {
             environment,
             api: environment.api,
             buildDir: process.env.API_BUILD_DIR,
+            migrateBuildDir: process.env.API_MIGRATE_BUILD_DIR,
             maintenance: apiMaintenance === "on",
             env: { region: config.aws.region },
         });

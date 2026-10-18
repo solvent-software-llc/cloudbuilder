@@ -126,6 +126,7 @@ describe("load: api", () => {
             architecture: "arm64",
             memoryMb: 512,
             timeoutSeconds: 10,
+            migrate: undefined,
         });
         expect(config.environments.map((e) => e.api)).toEqual([
             {
@@ -143,6 +144,13 @@ describe("load: api", () => {
             undefined,
         ]);
     });
+    it("parses api.migrate with a default timeout", () => {
+        const config = load(fixture("api-migrate"));
+        expect(config.api?.migrate).toStrictEqual({
+            main: "./cmd/migrate",
+            timeoutSeconds: 300,
+        });
+    });
     it("leaves api undefined everywhere without an api block", () => {
         const config = load(fixture("all-values"));
         expect(config.api).toBeUndefined();
@@ -156,6 +164,10 @@ describe("load: api", () => {
         ["api-param-collision", /secret "KEY" .* exposed as KEY_PARAM/],
         ["api-stack-collision", /stack name "solvent-software-site" is used by more than one stack/],
         ["env-api-without-api", /environments\[\]\.api is set .* no top-level api block/],
+        ["api-migrate-timeout", /api\.migrate_timeout must be an integer from 1 to 600/],
+        ["api-migrate-path", /api\.migrate "cmd\/migrate" must be a package path/],
+        ["api-migrate-same-main", /api\.migrate must be a different package from api\.main/],
+        ["api-migrate-timeout-without-migrate", /api\.migrate_timeout is set but api\.migrate is not/],
     ])("rejects %s", (name, error) => {
         expect(() => load(fixture(name))).toThrow(error);
     });

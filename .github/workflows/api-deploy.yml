@@ -111,6 +111,21 @@ jobs:
           CGO_ENABLED=0 GOOS=linux go build -tags lambda.norpc -o "$OUT_DIR/bootstrap" "$MAIN"
           echo "dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
 
+      # The migration binary is its own Lambda asset, so it builds into its own
+      # directory rather than shipping inside the API's.
+      - name: Build migrations
+        id: build-migrate
+        if: steps.env.outputs.migrate != ''
+        working-directory: ${{ steps.env.outputs.module }}
+        env:
+          GOARCH: ${{ steps.env.outputs.goarch }}
+          MIGRATE: ${{ steps.env.outputs.migrate }}
+        run: |
+          OUT_DIR="$RUNNER_TEMP/api-migrate-build"
+          mkdir -p "$OUT_DIR"
+          CGO_ENABLED=0 GOOS=linux go build -tags lambda.norpc -o "$OUT_DIR/bootstrap" "$MIGRATE"
+          echo "dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -135,6 +150,7 @@ jobs:
         env:
           CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
           API_BUILD_DIR: ${{ steps.build.outputs.dir }}
+          API_MIGRATE_BUILD_DIR: ${{ steps.build-migrate.outputs.dir }}
           API_MAINTENANCE: ${{ steps.maintenance.outputs.state }}
           STACK: ${{ steps.env.outputs.stack }}
         run: npx cdk deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json
