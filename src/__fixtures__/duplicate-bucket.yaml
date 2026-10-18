@@ -1,0 +1,15 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+site:
+  bucket_name: shared-bucket
+environments:
+  - name: production
+    branch: main
+  - name: preview
+    subdomain: preview
+    branch: dev
+    site:
+      bucket_name: shared-bucket

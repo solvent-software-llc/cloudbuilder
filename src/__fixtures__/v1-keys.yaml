@@ -1,0 +1,9 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+  bucket_name: custom-bucket
+environments:
+  - name: production
+    branch: main

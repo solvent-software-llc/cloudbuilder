@@ -19,6 +19,12 @@ export class GithubDeployRole extends cdk.Stack {
         // hardcoded guess, so a new environment's branch is trusted the moment
         // it's added to client.yaml.
         const branches = config.environments.map((e) => e.branch);
+        const sites = config.environments.flatMap((e) => (e.site ? [e.site] : []));
+        const hasApi = config.environments.some((e) => e.api);
+        const stackNames = config.environments.flatMap((e) => [
+            ...(e.site ? [e.site.stackName] : []),
+            ...(e.api ? [e.api.stackName] : []),
+        ]);
 
         // GitHub appends `@<immutable-id>` to the org and/or repo name in the sub
         // claim once either has ever been renamed (anti repo-jacking measure), so
@@ -73,6 +79,9 @@ export class GithubDeployRole extends cdk.Stack {
                     policyDocument: {
                         Version: "2012-10-17",
                         Statement: [
+                            // IAM rejects an empty Resource list, so these are only
+                            // emitted when the config has stacks / site buckets.
+                            ...(stackNames.length === 0 ? [] : [
                             {
                                 Sid: "CloudFormation",
                                 Effect: "Allow",
@@ -89,8 +98,13 @@ export class GithubDeployRole extends cdk.Stack {
                                     "cloudformation:GetTemplateSummary",
                                     "cloudformation:ListStackResources",
                                 ],
-                                Resource: `arn:aws:cloudformation:*:${this.account}:stack/${config.aws.stackName}/*`,
+                                Resource: stackNames.map(
+                                    (stackName) =>
+                                        `arn:aws:cloudformation:*:${this.account}:stack/${stackName}/*`,
+                                ),
                             },
+                            ]),
+                            ...(sites.length === 0 ? [] : [
                             {
                                 Sid: "S3Site",
                                 Effect: "Allow",
@@ -113,11 +127,25 @@ export class GithubDeployRole extends cdk.Stack {
                                     "s3:GetObject",
                                     "s3:DeleteObject",
                                 ],
-                                Resource: [
-                                    `arn:aws:s3:::${config.aws.bucketName}`,
-                                    `arn:aws:s3:::${config.aws.bucketName}/*`,
-                                ],
+                                Resource: sites.flatMap((site) => [
+                                    `arn:aws:s3:::${site.bucketName}`,
+                                    `arn:aws:s3:::${site.bucketName}/*`,
+                                ]),
                             },
+                            ]),
+                            ...(!hasApi ? [] : [
+                            {
+                                // bin/api-maintenance.sh reads and switches the API
+                                // stacks' $default route target directly as this role.
+                                // The API ids are generated at stack creation, after
+                                // this role exists, so this is scoped to routes of any
+                                // HTTP API in the region rather than specific APIs.
+                                Sid: "ApiMaintenance",
+                                Effect: "Allow",
+                                Action: ["apigateway:GET", "apigateway:PATCH"],
+                                Resource: `arn:aws:apigateway:${this.region}::/apis/*/routes/*`,
+                            },
+                            ]),
                             {
                                 // Most CloudFront actions do not support resource-level
                                 // IAM permissions, so this cannot be scoped to a single

@@ -3,6 +3,7 @@ import * as cdk from "aws-cdk-lib";
 import { GithubOidc } from "../src/oidc";
 import { StaticSite } from "../src/static-site";
 import { GithubDeployRole } from "../src/github-deploy-role";
+import { Api } from "../src/api";
 import { load } from "../src/config";
 
 const app = new cdk.App();
@@ -31,10 +32,35 @@ if (configPath) {
             });
         }
     }
-    new StaticSite(app, config.aws.stackName, {
-        config,
-        env: { region: config.aws.region },
-        crossRegionReferences: false,
-    });
+    for (const environment of config.environments) {
+        if (!environment.site) continue;
+        new StaticSite(app, environment.site.stackName, {
+            config,
+            environment,
+            site: environment.site,
+            env: { region: config.aws.region },
+            crossRegionReferences: false,
+        });
+    }
+    // Set by api-deploy.yml from the live route (bin/api-maintenance.sh
+    // status). Unset means off, so a hand-run `cdk deploy` of an API stack
+    // that's in maintenance takes it out of maintenance.
+    const apiMaintenance = process.env.API_MAINTENANCE ?? "off";
+    if (apiMaintenance !== "on" && apiMaintenance !== "off") {
+        throw new Error(`API_MAINTENANCE must be "on" or "off", got "${apiMaintenance}"`);
+    }
+    for (const environment of config.environments) {
+        if (!config.api || !environment.api) continue;
+        new Api(app, environment.api.stackName, {
+            config,
+            apiConfig: config.api,
+            environment,
+            api: environment.api,
+            buildDir: process.env.API_BUILD_DIR,
+            migrateBuildDir: process.env.API_MIGRATE_BUILD_DIR,
+            maintenance: apiMaintenance === "on",
+            env: { region: config.aws.region },
+        });
+    }
 
 }

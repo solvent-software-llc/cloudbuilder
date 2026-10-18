@@ -1,0 +1,35 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+  memory: 512
+  env:
+    LOG_LEVEL: info
+    PAGE_SIZE: 50
+  secrets:
+    TOKEN_SIGNING_KEY: /solvent/api/token-key
+environments:
+  - name: production
+    branch: main
+    api:
+      env:
+        LOG_LEVEL: warn
+  - name: preview
+    subdomain: preview
+    branch: dev
+    api:
+      stack_name: preview-api
+      secrets:
+        TOKEN_SIGNING_KEY: /solvent/api/preview/token-key
+  - name: sandbox
+    subdomain: sandbox
+    branch: sandbox
+    api:
+      enabled: false
+github:
+  org: solvent-software-llc
+  repos:
+    - solvent-api

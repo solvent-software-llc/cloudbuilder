@@ -8,6 +8,12 @@ A CDK app (`bin/app.ts`) that defines three kinds of stacks:
   certificate, CloudFront distribution (with a URL-rewrite function for
   clean URLs and subdomain routing), and Route53 records. Described by a
   `client.yaml` file and only synthesized when `CONFIG_PATH` is set.
+- a per-environment API stack (`src/api.ts`) — a Go Lambda behind an API
+  Gateway HTTP API at `api.<environment domain>`, with its own regional
+  certificate and Route53 records, plus a maintenance function the route can
+  be switched to. Only synthesized when `client.yaml` has an `api:` block
+  (normally only the API repo's). See "Deploying an API" and "API maintenance
+  mode" below.
 - a per-repo GitHub deploy-role stack (`src/github-deploy-role.ts`) — an
   IAM role a client's GitHub Actions workflow can assume via the OIDC
   provider to deploy that client's site stack. One is synthesized per
@@ -42,13 +48,25 @@ stack rather than creating a new one.
 | `slug`                  | yes      | Lowercase, hyphenated identifier (3-32 chars). Used to name AWS resources.  |
 | `domain`                | yes      | Root domain, e.g. `example.com`.                                            |
 | `name`                  | no       | Human-readable client name.                                                 |
-| `www`                   | no       | Also provision `www.<domain>` (and per-environment `www.` subdomains). Defaults to `true`. |
-| `public_env`            | no       | Map of `PUBLIC_`-prefixed build-time env vars (e.g. for SvelteKit).         |
+| `www`                   | no       | Also provision `www.<domain>` for the production environment (never for subdomain environments). Defaults to `true`. |
 | `aws.region`            | yes      | AWS region the stack is deployed to.                                       |
 | `aws.hosted_zone_id`    | yes      | Route53 hosted zone ID for `domain`.                                        |
-| `aws.stack_name`        | no       | CloudFormation stack name. Defaults to `<slug>-site`.                       |
-| `aws.bucket_name`       | no       | S3 bucket name. Defaults to `<domain>-site`.                                |
-| `environments`          | yes      | List of `{ name, branch, subdomain? }`. One entry with no `subdomain` is the production/root site; entries with a `subdomain` are routed to `<subdomain>.<domain>` and served from the `/<subdomain>` prefix in the bucket. Each `branch` must be unique — it's what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. |
+| `site`                  | no       | Static-site settings. **Site stacks are synthesized only if this block is present** (use `site: {}` for all defaults) — an API repo's `client.yaml` omits it. |
+| `site.stack_name`       | no       | Production's CloudFormation stack name. Defaults to `<slug>-site`.          |
+| `site.bucket_name`      | no       | Production's S3 bucket name. Defaults to `<domain>-site` — which contains dots, so always set this explicitly (see CLAUDE.md). |
+| `site.public_env`       | no       | Map of `PUBLIC_`-prefixed build-time env vars (e.g. for SvelteKit).         |
+| `api`                   | no       | Go API settings. **API stacks are synthesized only if this block is present** — normally only in the API repo's `client.yaml`. Each enabled environment gets an API at `api.<environment domain>`. |
+| `api.module`            | yes*     | Directory containing `go.mod`, relative to the repo root. Required if `api` is set. |
+| `api.main`              | no       | Package to build, relative to `api.module`. Defaults to `./cmd/lambda`.     |
+| `api.migrate`           | no       | Migration package to build, relative to `api.module` (e.g. `./cmd/migrate`). When set, every deploy runs it before updating the API. See "Database migrations". |
+| `api.migrate_timeout`   | no       | Migration timeout in seconds, 1–600. Defaults to `300`. Only valid with `api.migrate`. |
+| `api.architecture`      | no       | `arm64` (default) or `x86_64`.                                              |
+| `api.memory`            | no       | Lambda memory in MB, 128–10240. Defaults to `256`.                          |
+| `api.timeout`           | no       | Lambda timeout in seconds, 1–30 (API Gateway's integration cap). Defaults to `10`. |
+| `api.stack_name`        | no       | Production's API stack name. Defaults to `<slug>-api`; other environments default to `<slug>-<subdomain>-api`. |
+| `api.env`               | no       | Plain env vars for the function. `AWS_`/`LAMBDA_`/`_`-prefixed keys, the Parameters and Secrets extension's `PARAMETERS_SECRETS_EXTENSION_`/`SSM_PARAMETER_STORE_`/`SECRETS_MANAGER_` prefixes, and the stack-set `ALLOWED_ORIGINS`, `ENVIRONMENT`, `API_DOMAIN` are reserved. |
+| `api.secrets`           | no       | Map of env var key → SSM `SecureString` parameter **name** (e.g. `/client/api/key`), never a value. The function receives the name as `<KEY>_PARAM` and reads the value at runtime. |
+| `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, and `env`/`secrets` (merged over `api.env`/`api.secrets`); no environment may use the `api` subdomain. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
 
@@ -56,58 +74,25 @@ See `example/client.yaml` for a working example.
 
 ## Request flow
 
-Every request to a client's CloudFront distribution passes through the same
-pipeline regardless of which environment's domain it's addressed to; only
-the *data* threaded through that pipeline differs (the resolved key prefix).
-Tracing a request end to end:
+Each environment has its own stack, bucket, and CloudFront distribution, so
+a request only ever touches that environment's resources:
 
 1. **Viewer request → `UrlRewriteFunction`** (CloudFront Function,
-   `viewer-request`; runs on every request, before the cache is checked).
-   Reads the `Host` header — still the viewer's original host here
-   (`example.com`, `preview.example.com`, ...) — and:
-   - Appends `index.html` (trailing-slash URI) or `.html` (extensionless
-     URI): the "clean URL" rewrite.
-   - Looks up `Host` in `PREFIX_BY_HOST` (built from `environments[].subdomain`)
-     and, on a match, prepends that environment's `/<subdomain>` prefix to
-     the URI. The one entry with no `subdomain` (production) gets no
-     prefix — its content sits at the bucket root.
-   - Stashes the resolved prefix (or `''` for production) into a custom
-     `X-Env-Prefix` request header, for step 3 to use later.
+   `viewer-request`). Appends `index.html` to a trailing-slash URI or
+   `.html` to an extensionless one (`/about` → `/about.html`).
+2. **Cache lookup** (`CachePolicy.CACHING_OPTIMIZED`). A miss forwards to
+   the origin.
+3. **S3 origin (via OAC).** Found → 200. Not found → S3 returns 403
+   (`BlockPublicAccess.BLOCK_ALL` + OAC).
+4. **Error response.** The distribution's `errorResponses` map 403 and 404
+   to `/404.html`, returned as a real 404. That internal fetch skips
+   `UrlRewriteFunction`, which is fine: every environment's `404.html` sits
+   at its own bucket's root.
 
-   So `example.com/about` → `/about.html` (bucket root), while
-   `preview.example.com/about` → `/preview/about.html`.
-2. **Cache lookup.** `CachePolicy.CACHING_OPTIMIZED` computes the cache key
-   from the (already-rewritten) URI. A hit serves straight from the edge; a
-   miss forwards to the origin.
-3. **Origin request → `ErrorPagePrefixFunction`** (Lambda@Edge,
-   `origin-request`; only runs on a cache miss, right before CloudFront
-   forwards to S3). By this point CloudFront has already overwritten `Host`
-   with the *origin's* hostname (the S3 bucket endpoint) — the viewer's
-   original host is gone. That's what step 1's `X-Env-Prefix` header is for:
-   the `ForwardEnvPrefixHeader` `OriginRequestPolicy` is what keeps that
-   header alive from the viewer request through to here (without it,
-   `CachePolicy.CACHING_OPTIMIZED` alone forwards almost nothing, and the
-   header would be dropped before this function ever ran). The function
-   only acts if `uri === '/404.html'` (see step 5); for a normal request
-   it's a no-op passthrough.
-4. **S3 origin (via OAC).** CloudFront requests the (prefixed) key from the
-   bucket. Found → 200, served (and cached going forward). Not found → S3
-   (`BlockPublicAccess.BLOCK_ALL` + OAC) returns 403.
-5. **Error response → re-fetch `/404.html`.** The distribution's
-   `errorResponses` map both 403 and 404 from the origin to a synthetic
-   fetch of `/404.html`, returned to the viewer as an actual 404. That
-   internal re-fetch skips `UrlRewriteFunction` entirely — CloudFront never
-   re-runs `viewer-request` for it — so without step 3 it would always ask
-   for the bucket-root `/404.html`, regardless of which environment
-   errored. `ErrorPagePrefixFunction` rewrites it to `/<prefix>/404.html`
-   (using the `X-Env-Prefix` threaded through from step 1) right before it
-   goes to S3, so `preview.example.com`'s 404 serves preview's own 404
-   page — not production's, and not a raw S3 `AccessDenied` XML.
-
-For the root/production domain, `X-Env-Prefix` is always `''`, so step 5's
-rewrite is a no-op and `/404.html` resolves at the bucket root as-is — the
-whole prefix/header mechanism only does anything for a `subdomain`
-environment.
+V1 served every environment from one shared bucket under key prefixes,
+which needed a host→prefix map, an `X-Env-Prefix` header, an
+`OriginRequestPolicy`, and a Lambda@Edge function to get step 4 right. See
+`docs/v2-redesign.md`.
 
 > **Known limitation:** the ACM certificate is created in `aws.region`, but
 > CloudFront requires certificates to live in `us-east-1`. Until this is
@@ -145,10 +130,10 @@ establishes that AWS will accept GitHub's tokens at all.
    ```
    CONFIG_PATH=path/to/client.yaml npx cdk deploy <stack-name>
    ```
-   `<stack-name>` is `aws.stack_name` from `client.yaml` (or `<slug>-site`
-   if unset) — required because with `CONFIG_PATH` set the app contains
-   both this stack and `github-oidc-bootstrap`, so `cdk` refuses to guess
-   which one you mean.
+   `<stack-name>` is the target environment's stack (see `environments` above;
+   `CONFIG_PATH=... npx cdk ls` lists them all). It's required because with
+   `CONFIG_PATH` set the app contains one stack per environment plus
+   `github-oidc-bootstrap`, so `cdk` refuses to guess which one you mean.
    This creates the S3 bucket, requests and DNS-validates the ACM
    certificate, creates the CloudFront distribution, and creates the
    Route53 A/AAAA records. Certificate validation can take several minutes.
@@ -168,6 +153,183 @@ establishes that AWS will accept GitHub's tokens at all.
    bucket, and Route53 hosted zone (CloudFront and ACM cannot be scoped to a
    single resource; see the comments in `src/github-deploy-role.ts`). Note
    the `RoleArn` output and put it in that repo's deploy workflow.
+
+## Deploying an API
+
+An API repo carries its own `client.yaml` (same `slug`, `domain`, `www`,
+`aws`, and `environments[].subdomain`s as the site's, plus an `api:` block and
+its own `github.repos`) and calls the reusable `api-deploy.yml` workflow:
+
+```yaml
+jobs:
+  deploy:
+    uses: solvent-software-llc/cloudbuilder/.github/workflows/api-deploy.yml@v2
+    with:
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      cloudbuilder-ref: v2
+```
+
+The workflow resolves the branch to an environment (failing if it sets
+`api.enabled: false`), runs `go test ./...` in `api.module` (skip with
+`go-test: false`), builds `api.main` into a static `bootstrap` binary for
+`api.architecture`, and `cdk deploy`s that environment's API stack with
+`API_BUILD_DIR` pointing at the binary. Client repos don't choose build
+flags.
+
+Without `API_BUILD_DIR`, API stacks still appear in `cdk ls`/`synth` (using a
+placeholder asset) but carry an error annotation, so they can't be deployed by
+hand without a build. To deploy one manually:
+
+```
+(cd <api module> && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o /tmp/api-build/bootstrap ./cmd/lambda)
+CONFIG_PATH=path/to/client.yaml API_BUILD_DIR=/tmp/api-build npx cdk deploy <slug>-api
+```
+
+With `api.migrate` set, also build the migration package into its own
+directory and pass it as `API_MIGRATE_BUILD_DIR`.
+
+A hand-run deploy turns maintenance mode **off** unless you also pass
+`API_MAINTENANCE=on` (check first with `STACK=<stack> bin/api-maintenance.sh
+status`). See below.
+
+## Database migrations
+
+With `api.migrate` set, `api-deploy.yml` builds that package into a second
+`bootstrap` binary, and the API stack runs it as a Lambda that CloudFormation
+calls during `cdk deploy` (a CDK trigger), **before** it updates the API
+function. It gets the same `env`, `secrets`, and `ENVIRONMENT` as the API, so
+it reaches the same database.
+
+The binary is an ordinary Lambda handler that applies pending migrations and
+returns an error if any fail. It's invoked with an empty payload. For example,
+with goose and migrations embedded in the binary:
+
+```go
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+func handler(ctx context.Context) error {
+    db, err := openDB(ctx) // e.g. DATABASE_URL_PARAM via the secrets extension
+    if err != nil {
+        return err
+    }
+    defer db.Close()
+    goose.SetBaseFS(migrations)
+    if err := goose.SetDialect("postgres"); err != nil {
+        return err
+    }
+    return goose.UpContext(ctx, db, "migrations")
+}
+
+func main() { lambda.Start(handler) }
+```
+
+How it behaves:
+
+- **When it runs:** on a deploy where the migration binary changed. Embedding
+  the migrations means adding one changes the binary. A deploy that changes
+  only API code may skip it, which is fine because there's nothing new to
+  apply. Migrations must be idempotent (goose and golang-migrate skip
+  versions already applied).
+- **On failure:** the deploy fails and CloudFormation rolls the stack back,
+  so the old API code keeps serving. The schema is **not** rolled back:
+  whatever the migration already applied stays.
+- **Write migrations the old code can live with:** add columns and tables
+  first; drop or rename them in a later deploy, once no running code uses
+  them. When a change can't be made compatible, turn on maintenance mode
+  (below) before deploying, so no old code serves the new schema.
+- **Environments sharing a database:** every environment with an API runs
+  its migrations on deploy. If preview and production point at the same
+  database, a preview deploy migrates production's schema.
+- **Not on hotswap:** `cdk deploy --hotswap` / `cdk watch` update code without
+  going through CloudFormation, so migrations don't run.
+
+Output goes to the stack's `MigrateLogs` log group. A failed run's error also
+appears in the CloudFormation events for the `MigrateTrigger` resource.
+
+## API maintenance mode
+
+Every API stack also deploys a small maintenance function. Maintenance mode
+points the API's `$default` route at it instead of the Go function, so every
+request to `api.<domain>` gets the maintenance response. The site itself keeps
+loading from CloudFront; only its API calls are affected.
+
+### The maintenance response
+
+Clients (the site, the mobile app) should treat this as "we'll be right back",
+not as a generic error:
+
+```
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Cache-Control: no-store
+Retry-After: 60
+Access-Control-Allow-Origin: <the requesting site origin, if allowed>
+Access-Control-Allow-Credentials: true
+Access-Control-Expose-Headers: Retry-After
+
+{"maintenance": true}
+```
+
+- Detect it by the `{"maintenance": true}` body, not the 503 alone: other
+  failures can also be 503s.
+- CORS preflights (`OPTIONS`) are answered with `204` and the usual CORS
+  headers for allowed origins, so a browser's real request still goes out and
+  receives the 503 instead of failing as a network error.
+- While in maintenance, every route returns this, including a health
+  endpoint, so a client can poll any cheap endpoint every `Retry-After`
+  seconds (plus some jitter) and resume when it stops getting it.
+
+### Switching it on and off
+
+The API repo adds a manual workflow calling `api-maintenance.yml`:
+
+```yaml
+name: API maintenance
+on:
+  workflow_dispatch:
+    inputs:
+      state:
+        type: choice
+        options: ["on", "off"]
+jobs:
+  maintenance:
+    uses: solvent-software-llc/cloudbuilder/.github/workflows/api-maintenance.yml@v2
+    with:
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      cloudbuilder-ref: v2
+      state: ${{ inputs.state }}
+```
+
+Run it from the branch of the environment to switch (e.g. `main` for
+production): the branch picks the environment, the same way it does for
+`api-deploy.yml`, and must be one of `environments[].branch` for the deploy
+role to trust the run. The switch takes effect within seconds; no `cdk
+deploy` is involved.
+
+`api-deploy.yml` reads the current state before deploying and keeps it, so
+**deploys never turn maintenance on or off** — only this workflow does. A
+deploy made while maintenance is on finishes with a warning saying so.
+
+Typical uses:
+
+- **Shipping code and a schema change together:** turn maintenance on,
+  deploy, check the new code directly (below), turn maintenance off.
+- **A major bug:** turn maintenance on immediately, deploy fixes as many times
+  as needed, check, turn maintenance off.
+
+### Checking the new code while in maintenance
+
+`api.<domain>` only returns the maintenance response while maintenance is on,
+so call the function directly with your own AWS credentials. `FunctionName` is
+an API stack output. Adjust the event to whatever your Go adapter requires:
+
+```
+aws lambda invoke --function-name <FunctionName> \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"version":"2.0","routeKey":"$default","rawPath":"/healthz","rawQueryString":"","headers":{},"requestContext":{"http":{"method":"GET","path":"/healthz"}},"isBase64Encoded":false}' \
+  /dev/stdout
+```
 
 ## Updating an existing client
 
