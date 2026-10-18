@@ -218,4 +218,5 @@ exercised.
 
 ## V2
 
-See docs/v2-redesign.md for decisions surrounding v2.
+See docs/v2-redesign.md for decisions surrounding v2, and docs/database.md
+for the API database design.
