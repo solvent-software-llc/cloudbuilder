@@ -173,6 +173,56 @@ describe("load: api", () => {
     });
 });
 
+describe("load: database", () => {
+    it("parses the database block with defaults and per-environment overrides", () => {
+        const config = load(fixture("database"));
+        expect(config.environments.map((e) => e.database)).toStrictEqual([
+            {
+                stackName: "solvent-software-db",
+                postgresVersion: "18",
+                instanceClass: "db.t4g.small",
+                storageGb: 30,
+                maxStorageGb: 100,
+                backupRetentionDays: 14,
+            },
+            {
+                stackName: "preview-db",
+                postgresVersion: "19",
+                instanceClass: "db.t4g.micro",
+                storageGb: 30,
+                maxStorageGb: 100,
+                backupRetentionDays: 7,
+            },
+            // enabled: false
+            undefined,
+            // no API, so no database
+            undefined,
+        ]);
+    });
+    it("leaves database undefined everywhere without a database block", () => {
+        const config = load(fixture("api-migrate"));
+        expect(config.environments.every((e) => e.database === undefined)).toBe(true);
+    });
+    it("allows DB_* env vars when there is no database", () => {
+        const config = load(fixture("api-db-env-without-database"));
+        expect(config.environments[0].api?.env).toEqual({ DB_HOST: "elsewhere.example.com" });
+    });
+    it.each([
+        ["database-without-api", /database requires an api block with api\.migrate set/],
+        ["database-without-migrate", /database requires an api block with api\.migrate set/],
+        ["env-database-without-database", /environments\[\]\.database is set .* no top-level database block/],
+        ["database-api-disabled", /environments\[\]\.database .* is set but the environment has no API/],
+        ["database-reserved-env", /env var "DB_HOST" .* is reserved because the environment has a database/],
+        ["database-instance-class", /database\.instance_class "t4g\.micro" must be an RDS instance class/],
+        ["database-postgres-version", /database\.postgres_version "18\.3" must be a major version/],
+        ["database-max-storage", /max_storage \(100\) must be at least storage \(200\)/],
+        ["database-backup-retention", /database\.backup_retention must be an integer from 1 to 35/],
+        ["database-stack-collision", /stack name "solvent-software-api" is used by more than one stack/],
+    ])("rejects %s", (name, error) => {
+        expect(() => load(fixture(name))).toThrow(error);
+    });
+});
+
 describe("resolveEnvironment", () => {
     it("finds the environment matching a branch", () => {
         const config = load(fixture("all-values"));

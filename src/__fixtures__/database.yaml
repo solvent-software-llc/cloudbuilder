@@ -1,0 +1,32 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+  migrate: ./cmd/migrate
+database:
+  storage: 30
+environments:
+  - name: production
+    branch: main
+    database:
+      instance_class: db.t4g.small
+      backup_retention: 14
+  - name: preview
+    subdomain: preview
+    branch: dev
+    database:
+      postgres_version: 19
+      stack_name: preview-db
+  - name: sandbox
+    subdomain: sandbox
+    branch: sandbox
+    database:
+      enabled: false
+  - name: docs
+    subdomain: docs
+    branch: docs
+    api:
+      enabled: false
