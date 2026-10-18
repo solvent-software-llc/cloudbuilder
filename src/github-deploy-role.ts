@@ -20,6 +20,10 @@ export class GithubDeployRole extends cdk.Stack {
         // it's added to client.yaml.
         const branches = config.environments.map((e) => e.branch);
         const sites = config.environments.flatMap((e) => (e.site ? [e.site] : []));
+        const stackNames = config.environments.flatMap((e) => [
+            ...(e.site ? [e.site.stackName] : []),
+            ...(e.api ? [e.api.stackName] : []),
+        ]);
 
         // GitHub appends `@<immutable-id>` to the org and/or repo name in the sub
         // claim once either has ever been renamed (anti repo-jacking measure), so
@@ -74,9 +78,9 @@ export class GithubDeployRole extends cdk.Stack {
                     policyDocument: {
                         Version: "2012-10-17",
                         Statement: [
-                            // Site-only: an API-only client.yaml has no site stacks
-                            // or buckets, and IAM rejects an empty Resource list.
-                            ...(sites.length === 0 ? [] : [
+                            // IAM rejects an empty Resource list, so these are only
+                            // emitted when the config has stacks / site buckets.
+                            ...(stackNames.length === 0 ? [] : [
                             {
                                 Sid: "CloudFormation",
                                 Effect: "Allow",
@@ -93,11 +97,13 @@ export class GithubDeployRole extends cdk.Stack {
                                     "cloudformation:GetTemplateSummary",
                                     "cloudformation:ListStackResources",
                                 ],
-                                Resource: sites.map(
-                                    (site) =>
-                                        `arn:aws:cloudformation:*:${this.account}:stack/${site.stackName}/*`,
+                                Resource: stackNames.map(
+                                    (stackName) =>
+                                        `arn:aws:cloudformation:*:${this.account}:stack/${stackName}/*`,
                                 ),
                             },
+                            ]),
+                            ...(sites.length === 0 ? [] : [
                             {
                                 Sid: "S3Site",
                                 Effect: "Allow",

@@ -218,9 +218,13 @@ Mobile: same token system, different transport for the refresh token.
     (e.g. the API workflow comparing against the site repo's `client.yaml`)
     is a possible later addition, not built.
 
+- **Secrets:** read at runtime, not resolved at deploy time. `api.secrets`
+  holds SSM parameter names; the function gets each as `<KEY>_PARAM` and
+  fetches the value through the AWS Parameters and Secrets Lambda Extension
+  (5-minute cache). Values never appear in the CloudFormation template or the
+  Lambda console. The function's role gets `ssm:GetParameter` on exactly those
+  parameters; `aws/ssm`-encrypted SecureStrings need no extra KMS grant.
+
 ## Open questions
 
-- How secrets reach the Lambda: resolved at deploy time into env vars, or
-  read at runtime by the function (SSM/Secrets Manager SDK call, or the
-  Parameters and Secrets Lambda Extension). The second keeps secret values out
-  of the CloudFormation template and the Lambda console.
+- None currently.

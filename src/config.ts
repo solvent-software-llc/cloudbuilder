@@ -65,7 +65,15 @@ const STACK_NAME_RE = /^[A-Za-z][A-Za-z0-9-]*$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // Set by the API stack itself, or reserved by the Lambda runtime.
 const RESERVED_ENV_KEYS = new Set(["ALLOWED_ORIGINS", "ENVIRONMENT", "API_DOMAIN"]);
-const RESERVED_ENV_PREFIXES = ["AWS_", "LAMBDA_", "_"];
+const RESERVED_ENV_PREFIXES = [
+    "AWS_",
+    "LAMBDA_",
+    "_",
+    // Parameters and Secrets Lambda Extension settings, set by the API stack.
+    "PARAMETERS_SECRETS_EXTENSION_",
+    "SSM_PARAMETER_STORE_",
+    "SECRETS_MANAGER_",
+];
 // Hierarchical SSM names only, so the parameter ARN is simply
 // arn:...:parameter<name>.
 const SSM_NAME_RE = /^(\/[A-Za-z0-9_.-]+)+$/;

@@ -3,6 +3,7 @@ import * as cdk from "aws-cdk-lib";
 import { GithubOidc } from "../src/oidc";
 import { StaticSite } from "../src/static-site";
 import { GithubDeployRole } from "../src/github-deploy-role";
+import { Api } from "../src/api";
 import { load } from "../src/config";
 
 const app = new cdk.App();
@@ -39,6 +40,17 @@ if (configPath) {
             site: environment.site,
             env: { region: config.aws.region },
             crossRegionReferences: false,
+        });
+    }
+    for (const environment of config.environments) {
+        if (!config.api || !environment.api) continue;
+        new Api(app, environment.api.stackName, {
+            config,
+            apiConfig: config.api,
+            environment,
+            api: environment.api,
+            buildDir: process.env.API_BUILD_DIR,
+            env: { region: config.aws.region },
         });
     }
 
