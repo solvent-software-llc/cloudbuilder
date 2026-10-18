@@ -189,6 +189,15 @@ Changing this workflow's inputs/behavior is a breaking-change concern for
 every client repo that pins a ref to it, same as the old `workflows` repo —
 tag deliberately, don't silently retag `v1` under a contract change.
 
+`.github/workflows/api-deploy.yml` is the API counterpart, same consumer
+model and same `cloudbuilder-ref` contract. It calls `bin/resolve-env.ts`
+with `TARGET=api` (which also emits `module`/`main`/`goarch`), builds the Go
+binary itself with fixed flags into `$RUNNER_TEMP/api-build`, and passes
+that directory to the CDK app as `API_BUILD_DIR`. `src/api.ts` falls back to
+`assets/api-placeholder` plus an error annotation when it's unset, so
+`cdk ls` and synthesizing other stacks keep working without a Go build —
+don't turn that annotation into a thrown error.
+
 There is currently no equivalent `static-site-validate.yml` (a no-AWS-writes
 version for PR checks) — client repos still relying on the old
 `workflows`-repo validator will find it rejects `client.yaml`'s current

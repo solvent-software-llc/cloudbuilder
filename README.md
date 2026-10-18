@@ -8,6 +8,10 @@ A CDK app (`bin/app.ts`) that defines three kinds of stacks:
   certificate, CloudFront distribution (with a URL-rewrite function for
   clean URLs and subdomain routing), and Route53 records. Described by a
   `client.yaml` file and only synthesized when `CONFIG_PATH` is set.
+- a per-environment API stack (`src/api.ts`) — a Go Lambda behind an API
+  Gateway HTTP API at `api.<environment domain>`, with its own regional
+  certificate and Route53 records. Only synthesized when `client.yaml` has an
+  `api:` block (normally only the API repo's). See "Deploying an API" below.
 - a per-repo GitHub deploy-role stack (`src/github-deploy-role.ts`) — an
   IAM role a client's GitHub Actions workflow can assume via the OIDC
   provider to deploy that client's site stack. One is synthesized per
@@ -145,6 +149,37 @@ establishes that AWS will accept GitHub's tokens at all.
    bucket, and Route53 hosted zone (CloudFront and ACM cannot be scoped to a
    single resource; see the comments in `src/github-deploy-role.ts`). Note
    the `RoleArn` output and put it in that repo's deploy workflow.
+
+## Deploying an API
+
+An API repo carries its own `client.yaml` (same `slug`, `domain`, `www`,
+`aws`, and `environments[].subdomain`s as the site's, plus an `api:` block and
+its own `github.repos`) and calls the reusable `api-deploy.yml` workflow:
+
+```yaml
+jobs:
+  deploy:
+    uses: solvent-software-llc/cloudbuilder/.github/workflows/api-deploy.yml@v2
+    with:
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      cloudbuilder-ref: v2
+```
+
+The workflow resolves the branch to an environment (failing if it sets
+`api.enabled: false`), runs `go test ./...` in `api.module` (skip with
+`go-test: false`), builds `api.main` into a static `bootstrap` binary for
+`api.architecture`, and `cdk deploy`s that environment's API stack with
+`API_BUILD_DIR` pointing at the binary. Client repos don't choose build
+flags.
+
+Without `API_BUILD_DIR`, API stacks still appear in `cdk ls`/`synth` (using a
+placeholder asset) but carry an error annotation, so they can't be deployed by
+hand without a build. To deploy one manually:
+
+```
+(cd <api module> && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o /tmp/api-build/bootstrap ./cmd/lambda)
+CONFIG_PATH=path/to/client.yaml API_BUILD_DIR=/tmp/api-build npx cdk deploy <slug>-api
+```
 
 ## Updating an existing client
 

@@ -1,0 +1,154 @@
+name: API deploy
+
+on:
+  workflow_call:
+    inputs:
+      aws-role-arn:
+        description: IAM role ARN for the client account (from the github-deploy-role stack output)
+        required: true
+        type: string
+      config-path:
+        description: Path to client.yaml in the calling repo
+        required: false
+        type: string
+        default: client.yaml
+      node-version:
+        description: Node version for running cloudbuilder's CDK app (not the API)
+        required: false
+        type: string
+        default: '22'
+      go-test:
+        description: Run `go test ./...` in api.module before building
+        required: false
+        type: boolean
+        default: true
+      cloudbuilder-ref:
+        description: >
+          The ref/tag of THIS reusable workflow that the caller pinned in its
+          own `uses: .../api-deploy.yml@X` line (e.g. "v2") — pass the same
+          value here so the CDK app checked out below matches the version of
+          this workflow that's actually running. See static-site-deploy.yml
+          for why this can't be derived from `github.job_workflow_ref`.
+        required: true
+        type: string
+      branch:
+        description: >
+          Branch to deploy. Matched against client.yaml's environments[].branch
+          to pick the target environment; its API stack and api.<domain>
+          hostname follow from that. Fails if the environment sets
+          api.enabled: false. Defaults to the branch that triggered the run.
+        required: false
+        type: string
+        default: ${{ github.ref_name }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Checkout cloudbuilder
+        uses: actions/checkout@v4
+        with:
+          repository: solvent-software-llc/cloudbuilder
+          ref: ${{ inputs.cloudbuilder-ref }}
+          path: .cloudbuilder
+
+      # The API repo needn't have a package-lock.json of its own, so the npm
+      # cache keys off cloudbuilder's.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: .cloudbuilder/package-lock.json
+
+      - name: Install cloudbuilder dependencies
+        working-directory: .cloudbuilder
+        run: npm ci
+
+      # Branch -> environment matching, api.enabled, and the module/main/arch
+      # settings all come from cloudbuilder's config.ts — see bin/resolve-env.ts.
+      - name: Resolve environment
+        id: env
+        working-directory: .cloudbuilder
+        env:
+          CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
+          BRANCH: ${{ inputs.branch }}
+          TARGET: api
+        run: npx ts-node bin/resolve-env.ts
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ steps.env.outputs.module }}/go.mod
+          cache-dependency-path: ${{ steps.env.outputs.module }}/go.sum
+
+      - name: Test
+        if: inputs.go-test
+        working-directory: ${{ steps.env.outputs.module }}
+        run: go test ./...
+
+      # cloudbuilder owns these flags so client repos can't get them wrong:
+      # a static binary named `bootstrap` for provided.al2023, and the
+      # lambda.norpc tag, which drops aws-lambda-go's unused RPC mode. See
+      # docs/v2-redesign.md ("Bundling").
+      - name: Build
+        id: build
+        working-directory: ${{ steps.env.outputs.module }}
+        env:
+          GOARCH: ${{ steps.env.outputs.goarch }}
+          MAIN: ${{ steps.env.outputs.main }}
+        run: |
+          OUT_DIR="$RUNNER_TEMP/api-build"
+          mkdir -p "$OUT_DIR"
+          CGO_ENABLED=0 GOOS=linux go build -tags lambda.norpc -o "$OUT_DIR/bootstrap" "$MAIN"
+          echo "dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ steps.env.outputs.region }}
+          role-skip-session-tagging: true
+
+      - name: Deploy infrastructure
+        working-directory: .cloudbuilder
+        env:
+          CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
+          API_BUILD_DIR: ${{ steps.build.outputs.dir }}
+          STACK: ${{ steps.env.outputs.stack }}
+        run: npx cdk deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json
+
+      - name: Read stack outputs
+        id: stack
+        env:
+          STACK: ${{ steps.env.outputs.stack }}
+        run: |
+          OUT=.cloudbuilder/cdk-outputs.json
+          URL=$(jq -r --arg s "$STACK" '.[$s].ApiUrl' "$OUT")
+          FN=$(jq -r --arg s "$STACK" '.[$s].FunctionName' "$OUT")
+          if [ -z "$URL" ] || [ "$URL" = "null" ] || [ -z "$FN" ] || [ "$FN" = "null" ]; then
+            echo "::error::stack did not return ApiUrl and FunctionName"; exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "function=$FN" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          ENVIRONMENT: ${{ steps.env.outputs.environment }}
+          URL: ${{ steps.stack.outputs.url }}
+          STACK: ${{ steps.env.outputs.stack }}
+          FN: ${{ steps.stack.outputs.function }}
+        run: |
+          {
+            echo "### Deployed $ENVIRONMENT API to $URL"
+            echo "- Stack: \`$STACK\`"
+            echo "- Function: \`$FN\`"
+          } >> "$GITHUB_STEP_SUMMARY"
