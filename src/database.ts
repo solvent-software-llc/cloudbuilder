@@ -3,7 +3,7 @@ import { Construct } from "constructs";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as rds from "aws-cdk-lib/aws-rds";
 import * as ssm from "aws-cdk-lib/aws-ssm";
-import { Config, Environment } from "./config";
+import { Config, DatabaseParameter, Environment, databaseParameterPrefix } from "./config";
 
 export interface DatabaseProps extends cdk.StackProps {
     config: Config;
@@ -17,14 +17,6 @@ export const DATABASE_NAME = "app";
 export const APP_USER = "app";
 const MASTER_USER = "postgres";
 const PORT = 5432;
-
-// Where a database stack publishes what its API stack needs. The API stack
-// resolves these at deploy time, which keeps `cdk synth` offline; see
-// docs/database.md ("Wiring the API stacks to the database").
-export type DatabaseParameter = "host" | "port" | "resource-id" | "secret-arn";
-export function databaseParameterName(stackName: string, key: DatabaseParameter): string {
-    return `/cloudbuilder/${stackName}/${key}`;
-}
 
 // One per environment with an API: a publicly reachable RDS Postgres instance
 // in its own small VPC. Deployed by hand, never by a workflow — it holds the
@@ -123,7 +115,7 @@ export class Database extends cdk.Stack {
         };
         for (const [key, value] of Object.entries(parameters) as [DatabaseParameter, string][]) {
             new ssm.StringParameter(this, `Parameter-${key}`, {
-                parameterName: databaseParameterName(stackName, key),
+                parameterName: `${databaseParameterPrefix(stackName)}${key}`,
                 description: `${config.slug} ${environment.name} database ${key}, read by its API stack`,
                 stringValue: value,
             });

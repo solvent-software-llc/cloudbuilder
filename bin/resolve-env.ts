@@ -16,7 +16,7 @@
 // "#" isn't parsed as a comment.
 import * as fs from "fs";
 import * as path from "path";
-import { load, resolveEnvironment } from "../src/config";
+import { databaseParameterPrefix, load, resolveEnvironment } from "../src/config";
 
 const configPath = process.env.CONFIG_PATH;
 const branch = process.env.BRANCH;
@@ -60,6 +60,12 @@ if (target === "api") {
         main: config.api.main,
         // Empty when api.migrate isn't set, which skips the migrate build.
         migrate: config.api.migrate?.main ?? "",
+        // Empty when the environment has no database, which skips reading
+        // its SSM parameters.
+        "database-stack": environment.database?.stackName ?? "",
+        "database-parameter-prefix": environment.database
+            ? databaseParameterPrefix(environment.database.stackName)
+            : "",
         // Go's GOARCH spelling of the Lambda architecture.
         goarch: config.api.architecture === "arm64" ? "arm64" : "amd64",
     });

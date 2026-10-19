@@ -103,13 +103,33 @@ database's size. About **$18/month**; `db.t4g.small` is about $30.
 
 The database stack publishes what the API stack needs as SSM parameters
 under `/cloudbuilder/<database stack name>/`: `host`, `port`, `resource-id`
-(the `DbiResourceId`, for IAM auth), and `secret-arn`. The API stack reads
-them with `ssm.StringParameter.valueForStringParameter`, which CloudFormation
-resolves at deploy time. That keeps `cdk synth` working offline.
+(the `DbiResourceId`, for IAM auth), and `secret-arn`.
 
-Rejected: CloudFormation cross-stack exports. An export can't change while
-another stack imports it, and the two stacks are deployed separately (by hand
-and by `api-deploy.yml`), so exports would make database changes painful.
+`api-deploy.yml` reads them as the GitHub deploy role (which gets
+`ssm:GetParameters` on exactly those paths) and passes them into the CDK app
+as `API_DATABASE_PARAMETERS`, JSON tagged with the database stack's name.
+`bin/app.ts` hands them only to the API stack whose environment owns that
+database. Without them, that API stack carries an error annotation, like a
+missing `API_BUILD_DIR`. Synth keeps working offline, and only that stack
+refuses to deploy.
+
+Rejected:
+
+- **Resolving the parameters in CloudFormation**
+  (`ssm.StringParameter.valueForStringParameter`), the original plan.
+  CloudFormation evaluates SSM parameter types as the caller, which under
+  `cdk deploy` is the CDK bootstrap deploy role. The default bootstrap
+  template lets that role read only CDK's own version parameter, so the
+  deploy would fail. Widening it means a custom bootstrap per account.
+- **`ssm.StringParameter.valueFromLookup`:** a synth-time context lookup.
+  It would make synthesizing *any* stack in the API repo's config need AWS
+  credentials.
+- **A custom resource reading SSM:** it only re-reads when its own inputs
+  change, so a changed host could be missed.
+- **CloudFormation cross-stack exports:** an export can't change while
+  another stack imports it, and the two stacks are deployed separately (by
+  hand and by `api-deploy.yml`), so exports would make database changes
+  painful.
 
 The API function gets:
 
@@ -158,8 +178,8 @@ cloudbuilder, for one statement the migration can run.
 2. Deploy the API through `api-deploy.yml`. Its migration creates the `app`
    role, then the API function updates.
 
-If the database stack doesn't exist yet, the API deploy fails while creating
-the changeset (missing SSM parameters). That's the intended guard.
+If the database stack doesn't exist yet, `api-deploy.yml` fails before
+deploying, naming the missing SSM parameters. That's the intended guard.
 
 ## `client.yaml`
 
@@ -200,17 +220,11 @@ RDS CA bundle. A public endpoint makes this simple; no bastion is needed.
    security group, parameter group, instance, secret, SSM parameters).
    Verify by synth.
 3. `src/api.ts`: env vars, `rds-db:connect`, and secret read for migrations,
-   from the SSM parameters.
+   from the SSM parameters `api-deploy.yml` reads.
 4. README (schema, deploy order, connecting, Go snippet) and CLAUDE.md.
 
 ## Open questions
 
-- **SSM resolution at deploy time:** CloudFormation resolves
-  `AWS::SSM::Parameter::Value` parameters with the credentials of whoever
-  calls it. Here that's the CDK bootstrap deploy role, assumed by `cdk
-  deploy`. Confirm in step 3 that it can read `/cloudbuilder/*` parameters.
-  Fallback: `api-deploy.yml` reads them as the deploy role and passes them
-  into the CDK app as env vars.
 - **Secret rotation:** not built. Turning on Secrets Manager rotation for the
   master secret later is self-contained (only migrations use it).
 - **Restore runbook:** point-in-time restore creates a *new* instance outside

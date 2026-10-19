@@ -103,6 +103,15 @@ const MAX_API_TIMEOUT_SECONDS = 30;
 // migration is itself a Lambda capped at 15 minutes, and needs headroom.
 const MAX_MIGRATE_TIMEOUT_SECONDS = 600;
 
+// Where a database stack publishes what its API stack needs. api-deploy.yml
+// reads them and hands them to the CDK app as API_DATABASE_PARAMETERS; see
+// docs/database.md ("Wiring the API stacks to the database").
+export const DATABASE_PARAMETERS = ["host", "port", "resource-id", "secret-arn"] as const;
+export type DatabaseParameter = (typeof DATABASE_PARAMETERS)[number];
+export function databaseParameterPrefix(stackName: string): string {
+    return `/cloudbuilder/${stackName}/`;
+}
+
 // Set by the API stack for environments with a database; see docs/database.md.
 const DATABASE_ENV_KEYS = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_SECRET_ARN"];
 const POSTGRES_MAJOR_RE = /^[1-9][0-9]*$/;

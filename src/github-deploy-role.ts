@@ -1,7 +1,7 @@
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as iam from "aws-cdk-lib/aws-iam";
-import { Config } from "./config";
+import { Config, databaseParameterPrefix } from "./config";
 
 export interface GithubDeployRoleProps extends cdk.StackProps {
     config: Config;
@@ -21,6 +21,9 @@ export class GithubDeployRole extends cdk.Stack {
         const branches = config.environments.map((e) => e.branch);
         const sites = config.environments.flatMap((e) => (e.site ? [e.site] : []));
         const hasApi = config.environments.some((e) => e.api);
+        const databaseStackNames = config.environments.flatMap((e) =>
+            e.database ? [e.database.stackName] : [],
+        );
         const stackNames = config.environments.flatMap((e) => [
             ...(e.site ? [e.site.stackName] : []),
             ...(e.api ? [e.api.stackName] : []),
@@ -144,6 +147,24 @@ export class GithubDeployRole extends cdk.Stack {
                                 Effect: "Allow",
                                 Action: ["apigateway:GET", "apigateway:PATCH"],
                                 Resource: `arn:aws:apigateway:${this.region}::/apis/*/routes/*`,
+                            },
+                            ]),
+                            ...(databaseStackNames.length === 0 ? [] : [
+                            {
+                                // api-deploy.yml reads the database stacks' connection
+                                // parameters as this role and passes them into the CDK
+                                // app. CloudFormation can't resolve them itself: the CDK
+                                // bootstrap deploy role it runs as may only read CDK's
+                                // own version parameter. The database stacks themselves
+                                // are deliberately absent from the CloudFormation
+                                // statement above — they're deployed by hand.
+                                Sid: "DatabaseParameters",
+                                Effect: "Allow",
+                                Action: ["ssm:GetParameters"],
+                                Resource: databaseStackNames.map(
+                                    (stackName) =>
+                                        `arn:aws:ssm:${this.region}:${this.account}:parameter${databaseParameterPrefix(stackName)}*`,
+                                ),
                             },
                             ]),
                             {
