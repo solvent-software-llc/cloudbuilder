@@ -145,12 +145,35 @@ jobs:
           STATE=$(bin/api-maintenance.sh status)
           echo "state=$STATE" >> "$GITHUB_OUTPUT"
 
+      # CloudFormation can't read these itself (the CDK bootstrap deploy role
+      # it runs as has no access to them), so this role reads them and hands
+      # them to the CDK app. See docs/database.md.
+      - name: Read database parameters
+        id: database
+        if: steps.env.outputs.database-stack != ''
+        env:
+          DATABASE_STACK: ${{ steps.env.outputs.database-stack }}
+          PREFIX: ${{ steps.env.outputs.database-parameter-prefix }}
+        run: |
+          RESULT=$(aws ssm get-parameters --output json \
+            --names "${PREFIX}host" "${PREFIX}port" "${PREFIX}resource-id" "${PREFIX}secret-arn")
+          MISSING=$(jq -r '.InvalidParameters | join(", ")' <<<"$RESULT")
+          if [ -n "$MISSING" ]; then
+            echo "::error::missing SSM parameters $MISSING. Deploy the $DATABASE_STACK stack by hand first (see README's \"API database\")."
+            exit 1
+          fi
+          PARAMETERS=$(jq -c --arg prefix "$PREFIX" --arg stack "$DATABASE_STACK" \
+            '.Parameters | map({key: (.Name | ltrimstr($prefix)), value: .Value}) | from_entries + {stack: $stack}' \
+            <<<"$RESULT")
+          echo "parameters=$PARAMETERS" >> "$GITHUB_OUTPUT"
+
       - name: Deploy infrastructure
         working-directory: .cloudbuilder
         env:
           CONFIG_PATH: ${{ github.workspace }}/${{ inputs.config-path }}
           API_BUILD_DIR: ${{ steps.build.outputs.dir }}
           API_MIGRATE_BUILD_DIR: ${{ steps.build-migrate.outputs.dir }}
+          API_DATABASE_PARAMETERS: ${{ steps.database.outputs.parameters }}
           API_MAINTENANCE: ${{ steps.maintenance.outputs.state }}
           STACK: ${{ steps.env.outputs.stack }}
         run: npx cdk deploy "$STACK" --require-approval never --outputs-file cdk-outputs.json

@@ -108,6 +108,33 @@ the resolved prefix into a custom `X-Env-Prefix` header, and
 header alive through to the `origin-request` Lambda — `CachePolicy.
 CACHING_OPTIMIZED` alone strips it before the Lambda ever sees it.
 
+**CloudFormation can't read our SSM parameters under `cdk deploy`.**
+CloudFormation evaluates SSM parameter types (`ssm.StringParameter.
+valueForStringParameter`, `AWS::SSM::Parameter::Value`) as the caller, and
+under `cdk deploy` that's the CDK bootstrap *deploy* role. Unlike the
+cfn-exec role (see below), it's narrow: the default bootstrap template lets
+it read only CDK's own version parameter. This is why `api-deploy.yml` reads
+the database stack's `/cloudbuilder/<stack>/*` parameters itself, as the
+GitHub deploy role, and passes them in as `API_DATABASE_PARAMETERS` (see
+docs/database.md). Don't "simplify" that back into a deploy-time SSM
+reference. `valueFromLookup` isn't a fix either: it makes synthesizing any
+stack in that config need credentials.
+
+**Database stacks are public on purpose and deployed by hand.**
+`src/database.ts` opens 5432 to `0.0.0.0/0` and sets `publiclyAccessible`
+so the API Lambdas can stay out of any VPC (no NAT); docs/database.md,
+Decision 1. CloudFormation Validate's warnings about both are acknowledged
+in code (`Validations.of(...).acknowledge`, not `Annotations.acknowledge
+Warning`, which doesn't reach those warnings). "Deployed by hand" is a
+convention, not an IAM guarantee: no workflow here deploys a database
+stack, and none should. Leaving database stacks out of the GitHub deploy
+role's CloudFormation statement doesn't stop a workflow that tries, because
+`cdk deploy` acts through the CDK bootstrap deploy role. That role can
+create and execute change sets on any stack (`Resource: "*"` in the default
+bootstrap template), trusts the whole account, and the GitHub deploy role
+may assume it (`AssumeCdkBootstrapRoles`). The same applies to every
+per-stack CloudFormation scoping in that role; see the next section.
+
 ## The deploy role's IAM scoping is weaker than it looks — by design, for now
 
 `github-deploy-role.ts`'s policy is written per-service and per-resource (a
@@ -218,4 +245,5 @@ exercised.
 
 ## V2
 
-See docs/v2-redesign.md for decisions surrounding v2.
+See docs/v2-redesign.md for decisions surrounding v2, and docs/database.md
+for the API database design.

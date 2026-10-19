@@ -25,6 +25,20 @@ export interface Environment {
         // the name as <KEY>_PARAM and reads the value at runtime.
         secrets: Record<string, string>;
     };
+    // Present iff the config has a top-level `database:` block and this
+    // environment has an API and doesn't opt out with `database.enabled:
+    // false`. One RDS instance per environment, in its own stack; see
+    // docs/database.md.
+    database?: {
+        stackName: string;
+        // Major version only, e.g. "18"; RDS applies minor versions.
+        postgresVersion: string;
+        instanceClass: string;
+        storageGb: number;
+        // Storage autoscaling ceiling.
+        maxStorageGb: number;
+        backupRetentionDays: number;
+    };
 }
 
 export interface Config {
@@ -88,6 +102,48 @@ const MAX_API_TIMEOUT_SECONDS = 30;
 // Lambda allows 15 minutes, but the trigger provider that waits on the
 // migration is itself a Lambda capped at 15 minutes, and needs headroom.
 const MAX_MIGRATE_TIMEOUT_SECONDS = 600;
+
+// Where a database stack publishes what its API stack needs. api-deploy.yml
+// reads them and hands them to the CDK app as API_DATABASE_PARAMETERS; see
+// docs/database.md ("Wiring the API stacks to the database").
+export const DATABASE_PARAMETERS = ["host", "port", "resource-id", "secret-arn"] as const;
+export type DatabaseParameter = (typeof DATABASE_PARAMETERS)[number];
+export function databaseParameterPrefix(stackName: string): string {
+    return `/cloudbuilder/${stackName}/`;
+}
+
+// Set by the API stack for environments with a database; see docs/database.md.
+const DATABASE_ENV_KEYS = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_SECRET_ARN"];
+const POSTGRES_MAJOR_RE = /^[1-9][0-9]*$/;
+const INSTANCE_CLASS_RE = /^db\.[a-z0-9-]+\.[a-z0-9]+$/;
+// gp3 limits for RDS for PostgreSQL.
+const MIN_STORAGE_GB = 20;
+const MAX_STORAGE_GB = 65536;
+
+type DatabaseSettings = Omit<NonNullable<Environment["database"]>, "stackName">;
+
+// Parses one level of database settings (top-level or per-environment),
+// falling back to `defaults` for anything unset.
+function parseDatabaseSettings(raw: any, defaults: DatabaseSettings, where: string): DatabaseSettings {
+    const postgresVersion =
+        raw.postgres_version === undefined ? defaults.postgresVersion : String(raw.postgres_version);
+    if (!POSTGRES_MAJOR_RE.test(postgresVersion)) {
+        throw new Error(`client.yaml: ${where}.postgres_version "${postgresVersion}" must be a major version like "18"`);
+    }
+    const instanceClass = raw.instance_class ?? defaults.instanceClass;
+    if (typeof instanceClass !== "string" || !INSTANCE_CLASS_RE.test(instanceClass)) {
+        throw new Error(`client.yaml: ${where}.instance_class "${instanceClass}" must be an RDS instance class like "db.t4g.micro"`);
+    }
+    return {
+        postgresVersion,
+        instanceClass,
+        storageGb: parseIntInRange(raw.storage, defaults.storageGb, MIN_STORAGE_GB, MAX_STORAGE_GB, `${where}.storage`),
+        maxStorageGb: parseIntInRange(raw.max_storage, defaults.maxStorageGb, MIN_STORAGE_GB, MAX_STORAGE_GB, `${where}.max_storage`),
+        // 0 would turn off automated backups, which are the disaster plan
+        // for a bad migration.
+        backupRetentionDays: parseIntInRange(raw.backup_retention, defaults.backupRetentionDays, 1, 35, `${where}.backup_retention`),
+    };
+}
 
 function parsePackagePath(raw: unknown, where: string): string {
     if (typeof raw !== "string" || !raw.startsWith("./") || raw.split("/").includes("..")) {
@@ -231,6 +287,30 @@ export function load(path: string): Config {
         };
     }
 
+    const rawDatabase = raw.database;
+    let databaseDefaults: DatabaseSettings | undefined;
+    if (rawDatabase !== undefined) {
+        if (rawDatabase === null || typeof rawDatabase !== "object") {
+            throw new Error(`client.yaml: database must be a mapping (use "database: {}" for all defaults)`);
+        }
+        // The API connects as the `app` role, which only the migrations can
+        // create (docs/database.md, "Who creates the app user").
+        if (!apiConfig?.migrate) {
+            throw new Error(`client.yaml: database requires an api block with api.migrate set`);
+        }
+        databaseDefaults = parseDatabaseSettings(
+            rawDatabase,
+            {
+                postgresVersion: "18",
+                instanceClass: "db.t4g.micro",
+                storageGb: 20,
+                maxStorageGb: 100,
+                backupRetentionDays: 7,
+            },
+            "database",
+        );
+    }
+
     if (!raw.environments) {
         throw new Error(`client.yaml: missing environments`);
     }
@@ -368,6 +448,48 @@ export function load(path: string): Config {
             }
         }
 
+        let database: Environment["database"];
+        if (!databaseDefaults) {
+            if (env.database !== undefined) {
+                throw new Error(
+                    `client.yaml: environments[].database is set (environment "${env.name}") but there is no top-level database block`,
+                );
+            }
+        } else {
+            const rawEnvDatabase = env.database ?? {};
+            const where = `environments[].database (environment "${env.name}")`;
+            if (rawEnvDatabase === null || typeof rawEnvDatabase !== "object") {
+                throw new Error(`client.yaml: ${where} must be a mapping`);
+            }
+            if (!api) {
+                // Only an environment's API uses its database.
+                if (env.database !== undefined) {
+                    throw new Error(`client.yaml: ${where} is set but the environment has no API`);
+                }
+            } else if (rawEnvDatabase.enabled !== false) {
+                const stackName =
+                    rawEnvDatabase.stack_name ??
+                    (env.subdomain
+                        ? `${raw.slug}-${env.subdomain}-db`
+                        : (rawDatabase.stack_name ?? `${raw.slug}-db`));
+                claimStackName(stackName);
+                for (const key of DATABASE_ENV_KEYS) {
+                    if (key in api.env) {
+                        throw new Error(
+                            `client.yaml: env var "${key}" (environment "${env.name}") is reserved because the environment has a database`,
+                        );
+                    }
+                }
+                const settings = parseDatabaseSettings(rawEnvDatabase, databaseDefaults, where);
+                if (settings.maxStorageGb < settings.storageGb) {
+                    throw new Error(
+                        `client.yaml: ${where}: max_storage (${settings.maxStorageGb}) must be at least storage (${settings.storageGb})`,
+                    );
+                }
+                database = { stackName, ...settings };
+            }
+        }
+
         environments.push({
             name: env.name,
             subdomain: env.subdomain,
@@ -375,6 +497,7 @@ export function load(path: string): Config {
             domain,
             site,
             api,
+            database,
         });
     }
 

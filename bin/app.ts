@@ -4,7 +4,8 @@ import { GithubOidc } from "../src/oidc";
 import { StaticSite } from "../src/static-site";
 import { GithubDeployRole } from "../src/github-deploy-role";
 import { Api } from "../src/api";
-import { load } from "../src/config";
+import { Database } from "../src/database";
+import { DATABASE_PARAMETERS, DatabaseParameter, load } from "../src/config";
 
 const app = new cdk.App();
 
@@ -49,6 +50,27 @@ if (configPath) {
     if (apiMaintenance !== "on" && apiMaintenance !== "off") {
         throw new Error(`API_MAINTENANCE must be "on" or "off", got "${apiMaintenance}"`);
     }
+    // Set by api-deploy.yml from the database stack's SSM parameters, as JSON:
+    // {"stack": "<database stack>", "host": ..., "port": ..., ...}. Only the
+    // API stack whose environment owns that database gets them; every other
+    // API stack with a database keeps its "not set" error annotation.
+    let databaseParameters: { stack: string; values: Record<DatabaseParameter, string> } | undefined;
+    if (process.env.API_DATABASE_PARAMETERS) {
+        const raw = JSON.parse(process.env.API_DATABASE_PARAMETERS);
+        const missing = ["stack", ...DATABASE_PARAMETERS].filter(
+            (key) => typeof raw[key] !== "string" || !raw[key],
+        );
+        if (missing.length > 0) {
+            throw new Error(`API_DATABASE_PARAMETERS is missing: ${missing.join(", ")}`);
+        }
+        databaseParameters = {
+            stack: raw.stack,
+            values: Object.fromEntries(DATABASE_PARAMETERS.map((key) => [key, raw[key]])) as Record<
+                DatabaseParameter,
+                string
+            >,
+        };
+    }
     for (const environment of config.environments) {
         if (!config.api || !environment.api) continue;
         new Api(app, environment.api.stackName, {
@@ -58,7 +80,20 @@ if (configPath) {
             api: environment.api,
             buildDir: process.env.API_BUILD_DIR,
             migrateBuildDir: process.env.API_MIGRATE_BUILD_DIR,
+            databaseParameters:
+                environment.database && databaseParameters?.stack === environment.database.stackName
+                    ? databaseParameters.values
+                    : undefined,
             maintenance: apiMaintenance === "on",
+            env: { region: config.aws.region },
+        });
+    }
+    for (const environment of config.environments) {
+        if (!environment.database) continue;
+        new Database(app, environment.database.stackName, {
+            config,
+            environment,
+            database: environment.database,
             env: { region: config.aws.region },
         });
     }

@@ -11,7 +11,8 @@ import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
-import { Config, Environment } from "./config";
+import { Config, DatabaseParameter, Environment } from "./config";
+import { APP_USER, DATABASE_NAME } from "./database";
 
 export interface ApiProps extends cdk.StackProps {
     config: Config;
@@ -24,6 +25,10 @@ export interface ApiProps extends cdk.StackProps {
     buildDir?: string;
     // Same, for the migration binary when api.migrate is set.
     migrateBuildDir?: string;
+    // The environment's database stack's SSM parameters, read by the API
+    // deploy workflow (API_DATABASE_PARAMETERS). Undefined outside a real
+    // deploy, handled like a missing buildDir.
+    databaseParameters?: Record<DatabaseParameter, string>;
     // Whether the $default route targets the maintenance function. The deploy
     // workflow reads the live route and passes its state through, so a deploy
     // never turns maintenance on or off — only api-maintenance.yml does.
@@ -43,8 +48,16 @@ export class Api extends cdk.Stack {
     constructor(scope: Construct, id: string, props: ApiProps) {
         super(scope, id, props);
 
-        const { config, apiConfig, environment, api, buildDir, migrateBuildDir, maintenance } =
-            props;
+        const {
+            config,
+            apiConfig,
+            environment,
+            api,
+            buildDir,
+            migrateBuildDir,
+            databaseParameters,
+            maintenance,
+        } = props;
         const zone = route53.HostedZone.fromHostedZoneAttributes(this, "Zone", {
             hostedZoneId: config.aws.hostedZoneId,
             zoneName: config.domain,
@@ -89,6 +102,34 @@ export class Api extends cdk.Stack {
             Object.entries(api.secrets).map(([key, name]) => [`${key}_PARAM`, name]),
         );
 
+        // The environment's database (docs/database.md). The API connects as
+        // the `app` role with IAM auth tokens; migrations connect as the
+        // master user from its secret. Both get host/port/name.
+        let database: Record<DatabaseParameter, string> | undefined;
+        if (environment.database) {
+            database = databaseParameters;
+            if (!database) {
+                cdk.Annotations.of(this).addError(
+                    `API_DATABASE_PARAMETERS has no values for database stack ${environment.database.stackName}, so this stack can't reach its database`,
+                );
+                // Never deployed (the annotation blocks it); ARN-shaped only so
+                // template validation doesn't add noise.
+                database = {
+                    host: "unset",
+                    port: "0",
+                    "resource-id": "unset",
+                    "secret-arn": `arn:aws:secretsmanager:${this.region}:${this.account}:secret:unset`,
+                };
+            }
+        }
+        const apiDatabaseEnv: Record<string, string> = {};
+        const migrateDatabaseEnv: Record<string, string> = {};
+        if (database) {
+            const shared = { DB_HOST: database.host, DB_PORT: database.port, DB_NAME: DATABASE_NAME };
+            Object.assign(apiDatabaseEnv, shared, { DB_USER: APP_USER });
+            Object.assign(migrateDatabaseEnv, shared, { DB_SECRET_ARN: database["secret-arn"] });
+        }
+
         const logGroup = new logs.LogGroup(this, "FunctionLogs", {
             retention: logs.RetentionDays.ONE_MONTH,
             removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -110,10 +151,23 @@ export class Api extends cdk.Stack {
                 ALLOWED_ORIGINS: allowedOrigins,
                 ENVIRONMENT: environment.name,
                 API_DOMAIN: api.domain,
+                ...apiDatabaseEnv,
             },
             paramsAndSecrets,
         });
         const secretReaders: lambda.Function[] = [fn];
+        if (database) {
+            // IAM auth: lets this role mint connection tokens for the `app`
+            // role on this environment's instance only.
+            fn.addToRolePolicy(
+                new iam.PolicyStatement({
+                    actions: ["rds-db:connect"],
+                    resources: [
+                        `arn:aws:rds-db:${this.region}:${this.account}:dbuser:${database["resource-id"]}/${APP_USER}`,
+                    ],
+                }),
+            );
+        }
 
         // Migrations: a second Go binary that CloudFormation invokes once per
         // deploy (whenever its code changes) through a CDK trigger, before the
@@ -140,10 +194,22 @@ export class Api extends cdk.Stack {
                     ...api.env,
                     ...secretParamEnv,
                     ENVIRONMENT: environment.name,
+                    ...migrateDatabaseEnv,
                 },
                 paramsAndSecrets,
             });
             secretReaders.push(migrateFn);
+            if (database) {
+                // The master credentials, read through the same extension.
+                // The secret uses the AWS-managed aws/secretsmanager key, so no
+                // kms:Decrypt grant is needed.
+                migrateFn.addToRolePolicy(
+                    new iam.PolicyStatement({
+                        actions: ["secretsmanager:GetSecretValue"],
+                        resources: [database["secret-arn"]],
+                    }),
+                );
+            }
             // Not TriggerFunction: it uses one `timeout` for both the function
             // and the trigger's wait on it, so the wait could give up just as
             // a slow migration finishes. The trigger provider is a Lambda

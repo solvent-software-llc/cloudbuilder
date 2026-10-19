@@ -1,0 +1,16 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+  migrate: ./cmd/migrate
+database: {}
+environments:
+  - name: production
+    branch: main
+    api:
+      enabled: false
+    database:
+      instance_class: db.t4g.small
