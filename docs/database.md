@@ -61,8 +61,17 @@ API stacks' naming, overridable).
   A stateful resource shouldn't share a stack with them, where a construct
   change could force a replacement. Database stacks are deployed by hand
   (`cdk deploy <slug>-db`), like the account bootstrap, so changes to them are
-  deliberate. They're not in the deploy role's CloudFormation statement, so a
-  workflow can't deploy them.
+  deliberate. That's a convention enforced by which workflows exist, not by
+  IAM: no cloudbuilder workflow deploys a database stack, but the GitHub
+  deploy role could. `cdk deploy` makes its CloudFormation calls through the
+  CDK bootstrap deploy role, which the default bootstrap lets act on any
+  stack, so leaving database stacks out of the GitHub role's CloudFormation
+  statement doesn't stop it (see CLAUDE.md, "The deploy role's IAM scoping is
+  weaker than it looks"). Enforcing it would need a narrower custom bootstrap
+  per account. What protects the data if a database stack is deployed by
+  mistake: deletion protection blocks deleting the instance, and a
+  replacement leaves a snapshot. A forced replacement could still create a
+  new, empty instance and repoint the API at it.
 - **Own VPC:** RDS must live in a VPC with a subnet group spanning two AZs.
   Each database stack creates a small VPC with public subnets only (no NAT;
   VPCs and internet gateways are free). Rejected: the account's default VPC,

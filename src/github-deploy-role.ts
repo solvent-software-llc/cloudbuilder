@@ -156,8 +156,10 @@ export class GithubDeployRole extends cdk.Stack {
                                 // app. CloudFormation can't resolve them itself: the CDK
                                 // bootstrap deploy role it runs as may only read CDK's
                                 // own version parameter. The database stacks themselves
-                                // are deliberately absent from the CloudFormation
-                                // statement above — they're deployed by hand.
+                                // are left out of the CloudFormation statement above
+                                // because no workflow deploys them, but that doesn't
+                                // prevent it: cdk deploy acts through the CDK bootstrap
+                                // deploy role, which can update any stack (CLAUDE.md).
                                 Sid: "DatabaseParameters",
                                 Effect: "Allow",
                                 Action: ["ssm:GetParameters"],

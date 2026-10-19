@@ -125,9 +125,15 @@ stack in that config need credentials.
 so the API Lambdas can stay out of any VPC (no NAT); docs/database.md,
 Decision 1. CloudFormation Validate's warnings about both are acknowledged
 in code (`Validations.of(...).acknowledge`, not `Annotations.acknowledge
-Warning`, which doesn't reach those warnings). The database stacks are
-deliberately missing from the deploy role's CloudFormation statement: a
-push must never be able to replace a database.
+Warning`, which doesn't reach those warnings). "Deployed by hand" is a
+convention, not an IAM guarantee: no workflow here deploys a database
+stack, and none should. Leaving database stacks out of the GitHub deploy
+role's CloudFormation statement doesn't stop a workflow that tries, because
+`cdk deploy` acts through the CDK bootstrap deploy role. That role can
+create and execute change sets on any stack (`Resource: "*"` in the default
+bootstrap template), trusts the whole account, and the GitHub deploy role
+may assume it (`AssumeCdkBootstrapRoles`). The same applies to every
+per-stack CloudFormation scoping in that role; see the next section.
 
 ## The deploy role's IAM scoping is weaker than it looks — by design, for now
 
