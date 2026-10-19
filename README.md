@@ -39,7 +39,9 @@ stack rather than creating a new one.
 - AWS credentials for the client's target account active in your shell
   (e.g. via `AWS_PROFILE` or exported env vars), with permissions to manage
   S3, CloudFront, ACM, Route53, and (for the one-time bootstrap only) IAM.
-- The target account/region must already be CDK-bootstrapped:
+- The target account/region must already be CDK-bootstrapped: `make
+  cdk-bootstrap` from a client repo (see "Running cloudbuilder from a client
+  repo"), or from a checkout:
   ```
   npx cdk bootstrap aws://<ACCOUNT_ID>/<REGION>
   ```
@@ -112,46 +114,70 @@ which needed a host→prefix map, an `X-Env-Prefix` header, an
 
 ## Running cloudbuilder from a client repo
 
-The stacks deployed by hand (the account bootstrap, deploy roles, databases)
-can be deployed from the client repo itself, with your own AWS credentials
-and no cloudbuilder checkout:
+Workflows deploy the site and API stacks. The rest (CDK's bootstrap, the
+GitHub OIDC provider, deploy roles, databases) are deployed by hand, from
+the client repo itself, with your own AWS credentials and no cloudbuilder
+checkout. Each client repo carries a copy of
+[`example/Makefile`](example/Makefile) for this. Copy the file rather than
+pasting from this page: recipe lines must start with a tab.
 
-```
-cd path/to/client-repo
-AWS_PROFILE=<client admin> npx --allow-git=root github:solvent-software-llc/cloudbuilder#v2 diff <stack>
-AWS_PROFILE=<client admin> npx --allow-git=root github:solvent-software-llc/cloudbuilder#v2 deploy <stack>
-```
+Set its variables for the repo:
 
-- **Config:** it uses the `client.yaml` at the git root of the current
-  directory. `--config <path>` overrides that.
-- **Arguments** go straight to the CDK CLI: `ls`, `diff`, `synth`,
-  `deploy`, stack names, and options.
-- **Version:** pin the same ref the repo's workflows use (`@v2` /
-  `cloudbuilder-ref: v2`), so a hand deploy runs the same CDK code as CI.
-  npx checks the ref again on every run, so a moved tag is picked up next
-  time.
+| Variable | Set to |
+|---|---|
+| `CLOUDBUILDER_REF` | The same ref the repo's workflows pin (`@v2` / `cloudbuilder-ref: v2`), so a hand deploy runs the same CDK code as CI. |
+| `DEPLOY_ROLE_STACK` | This repo's `github-deploy-role-*` stack, as `make stacks` lists it. |
+| `DB` | API repo only: production's database stack (`<slug>-db`). |
+| `AWS_REGION` | Leave as `us-east-1` (the static tier's only region). |
+
+Then run each target with an admin profile for the client's account, e.g.
+`AWS_PROFILE=acme-admin make deploy-role`:
+
+| Target | When | What it runs |
+|---|---|---|
+| `make stacks` | Any time | Lists this client's stacks |
+| `make cdk-bootstrap` | Once per AWS account and region | `cdk bootstrap` for the account your credentials point at |
+| `make oidc-bootstrap` | Once per AWS account, from any one client repo | Deploys `github-oidc-bootstrap` (see "Account bootstrap") |
+| `make deploy-role` | Once per repo, and again after changing `client.yaml`'s environments, stack names, or databases | Deploys this repo's deploy role |
+| `make db-diff` / `make db-deploy` | API repo: first setup, then any database change | Diffs/deploys the database stack. `DB=<stack>` picks another environment's, e.g. `make db-deploy DB=acme-preview-db` |
+
+For a brand-new client account, in order:
+
+1. `make cdk-bootstrap`
+2. `make oidc-bootstrap` (skip if the account already has the provider)
+3. `make deploy-role` in each client repo, then put its `RoleArn` output in
+   that repo's `AWS_ROLE_ARN` variable for the workflows
+4. API repo with a database: `make db-diff`, then `make db-deploy`, for each
+   environment (see "API database")
+5. Push, and the workflows deploy the site and API
+
+How it works: each target runs
+`npx --allow-git=root github:solvent-software-llc/cloudbuilder#<ref> <cdk
+args>`. That runs cloudbuilder's CDK app against the `client.yaml` at the
+repo's git root, passing the arguments through to the CDK CLI. Things to
+know:
+
 - **`--allow-git=root`:** npm 12 refuses git dependencies by default. This
-  opts in for the one package you name, not its dependencies.
+  opts in for the one package named, not its dependencies.
+- **Moved refs:** npx checks the ref again on every run, so a moved `v2`
+  tag is picked up next time. To force a clean reinstall, delete
+  `"$(npm config get cache)/_npx"`.
 - **First run** takes a couple of minutes to install the CDK; later runs
   use npm's cache. Nothing is written to the client repo (`cdk.out` lands
   in the cache).
-
-An alias keeps it short:
-
-```
-alias cloudbuilder='npx -y --allow-git=root github:solvent-software-llc/cloudbuilder#v2'
-AWS_PROFILE=acme-admin cloudbuilder deploy acme-db
-```
+- **Other commands:** add a target, or run the npx command directly with
+  any CDK arguments. `--config <path>` points it at a different
+  `client.yaml`.
 
 From a cloudbuilder checkout, `CONFIG_PATH=path/to/client.yaml npx cdk
-<command> <stack>` does the same thing, which is what the rest of this README
-shows.
+<command> <stack>` does the same thing.
 
 ## Account bootstrap (one-time)
 
 Before onboarding the *first* client in a given AWS account, create the
 GitHub Actions OIDC provider once, manually, with an admin-capable
-credential (never from a GitHub Actions workflow itself):
+credential (never from a GitHub Actions workflow itself): `make
+oidc-bootstrap` from any client repo, or from a checkout:
 ```
 npx cdk deploy github-oidc-bootstrap
 ```
@@ -191,7 +217,8 @@ establishes that AWS will accept GitHub's tokens at all.
    to the bucket and invalidating the CloudFront distribution after each
    deploy is outside the scope of this repo).
 7. For each GitHub repo that should be able to deploy this client's site,
-   add it to `github.repos` in `client.yaml`, then deploy its role:
+   add it to `github.repos` in `client.yaml`, then deploy its role with
+   `make deploy-role` from that repo, or from a checkout:
    ```
    CONFIG_PATH=path/to/client.yaml npx cdk deploy github-deploy-role-<slug>-<repo>
    ```
@@ -314,13 +341,17 @@ environment costs about $18/month.
 
 1. Add `database: {}` (or settings) to the API repo's `client.yaml`, which
    must also set `api.migrate`.
-2. Redeploy the API repo's `github-deploy-role-*` stack, so the role can read
-   the new database's connection parameters.
-3. Deploy the database stack **by hand**. Workflows never deploy it:
+2. `make deploy-role` in the API repo, so its deploy role can read the new
+   database's connection parameters.
+3. Deploy the database stack **by hand**; workflows never deploy it. From
+   the API repo:
    ```
-   CONFIG_PATH=path/to/client.yaml npx cdk deploy <slug>-db
+   AWS_PROFILE=<client admin> make db-diff
+   AWS_PROFILE=<client admin> make db-deploy
    ```
-   It publishes `host`, `port`, `resource-id`, and `secret-arn` as SSM
+   That's production's (`DB` in the Makefile). Pass `DB=<stack>` for each
+   other environment, e.g. `make db-deploy DB=<slug>-preview-db`. The stack
+   publishes `host`, `port`, `resource-id`, and `secret-arn` as SSM
    parameters under `/cloudbuilder/<database stack>/`.
 4. Add the first migration below, then deploy the API through
    `api-deploy.yml`. The workflow reads those SSM parameters and passes them
@@ -420,9 +451,9 @@ psql "host=<Endpoint> port=5432 dbname=app user=postgres sslmode=verify-full ssl
 
 ### Changing or removing a database
 
-Edit `client.yaml` and `cdk deploy` the database stack by hand; check `cdk
-diff` first, since some changes (e.g. a storage *decrease*) aren't possible
-in place. Deleting the stack fails until deletion protection is turned off
+Edit `client.yaml`, then `make db-diff` and `make db-deploy` (with
+`DB=<stack>` for a non-production environment). Read the diff first, since
+some changes (e.g. a storage *decrease*) aren't possible in place. Deleting the stack fails until deletion protection is turned off
 on the instance, and even then leaves a final snapshot.
 
 ## API maintenance mode
