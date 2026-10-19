@@ -110,6 +110,41 @@ which needed a host→prefix map, an `X-Env-Prefix` header, an
 > CloudFront requires certificates to live in `us-east-1`. Until this is
 > fixed, set `aws.region: us-east-1` in every `client.yaml`.
 
+## Running cloudbuilder from a client repo
+
+The stacks deployed by hand (the account bootstrap, deploy roles, databases)
+can be deployed from the client repo itself, with your own AWS credentials
+and no cloudbuilder checkout:
+
+```
+cd path/to/client-repo
+AWS_PROFILE=<client admin> npx --allow-git=root github:solvent-software-llc/cloudbuilder#v2 diff <stack>
+AWS_PROFILE=<client admin> npx --allow-git=root github:solvent-software-llc/cloudbuilder#v2 deploy <stack>
+```
+
+- **Config:** it uses the `client.yaml` at the git root of the current
+  directory. `--config <path>` overrides that.
+- **Arguments** go straight to the CDK CLI: `ls`, `diff`, `synth`,
+  `deploy`, stack names, and options.
+- **Version:** pin the same ref the repo's workflows use (`@v2` /
+  `cloudbuilder-ref: v2`), so a hand deploy runs the same CDK code as CI.
+- **`--allow-git=root`:** npm 12 refuses git dependencies by default. This
+  opts in for the one package you name, not its dependencies.
+- **First run** takes a couple of minutes to install the CDK; later runs
+  use npm's cache. Nothing is written to the client repo (`cdk.out` lands
+  in the cache).
+
+An alias keeps it short:
+
+```
+alias cloudbuilder='npx -y --allow-git=root github:solvent-software-llc/cloudbuilder#v2'
+AWS_PROFILE=acme-admin cloudbuilder deploy acme-db
+```
+
+From a cloudbuilder checkout, `CONFIG_PATH=path/to/client.yaml npx cdk
+<command> <stack>` does the same thing, which is what the rest of this README
+shows.
+
 ## Account bootstrap (one-time)
 
 Before onboarding the *first* client in a given AWS account, create the

@@ -4,6 +4,13 @@
   "bin": {
     "cloudbuilder": "bin/cloudbuilder.mjs"
   },
+  "files": [
+    "bin",
+    "src",
+    "assets",
+    "cdk.json",
+    "tsconfig.json"
+  ],
   "scripts": {
     "synth": "cdk synth",
     "deploy": "cdk deploy",
