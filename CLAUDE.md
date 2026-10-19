@@ -108,6 +108,27 @@ the resolved prefix into a custom `X-Env-Prefix` header, and
 header alive through to the `origin-request` Lambda — `CachePolicy.
 CACHING_OPTIMIZED` alone strips it before the Lambda ever sees it.
 
+**CloudFormation can't read our SSM parameters under `cdk deploy`.**
+CloudFormation evaluates SSM parameter types (`ssm.StringParameter.
+valueForStringParameter`, `AWS::SSM::Parameter::Value`) as the caller, and
+under `cdk deploy` that's the CDK bootstrap *deploy* role. Unlike the
+cfn-exec role (see below), it's narrow: the default bootstrap template lets
+it read only CDK's own version parameter. This is why `api-deploy.yml` reads
+the database stack's `/cloudbuilder/<stack>/*` parameters itself, as the
+GitHub deploy role, and passes them in as `API_DATABASE_PARAMETERS` (see
+docs/database.md). Don't "simplify" that back into a deploy-time SSM
+reference. `valueFromLookup` isn't a fix either: it makes synthesizing any
+stack in that config need credentials.
+
+**Database stacks are public on purpose and deployed by hand.**
+`src/database.ts` opens 5432 to `0.0.0.0/0` and sets `publiclyAccessible`
+so the API Lambdas can stay out of any VPC (no NAT); docs/database.md,
+Decision 1. CloudFormation Validate's warnings about both are acknowledged
+in code (`Validations.of(...).acknowledge`, not `Annotations.acknowledge
+Warning`, which doesn't reach those warnings). The database stacks are
+deliberately missing from the deploy role's CloudFormation statement: a
+push must never be able to replace a database.
+
 ## The deploy role's IAM scoping is weaker than it looks — by design, for now
 
 `github-deploy-role.ts`'s policy is written per-service and per-resource (a

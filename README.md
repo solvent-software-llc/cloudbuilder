@@ -1,6 +1,6 @@
 # cloudbuilder
 
-A CDK app (`bin/app.ts`) that defines three kinds of stacks:
+A CDK app (`bin/app.ts`) that defines these kinds of stacks:
 
 - `github-oidc-bootstrap` (`src/oidc.ts`) — a one-time, account-wide GitHub
   Actions OIDC provider. Only ever one of these per AWS account.
@@ -14,6 +14,11 @@ A CDK app (`bin/app.ts`) that defines three kinds of stacks:
   be switched to. Only synthesized when `client.yaml` has an `api:` block
   (normally only the API repo's). See "Deploying an API" and "API maintenance
   mode" below.
+- a per-environment database stack (`src/database.ts`) — a publicly
+  reachable RDS Postgres instance in its own small VPC, for that
+  environment's API. Only synthesized when `client.yaml` has a `database:`
+  block, and deployed by hand, never by a workflow. See "API database" below
+  and `docs/database.md`.
 - a per-repo GitHub deploy-role stack (`src/github-deploy-role.ts`) — an
   IAM role a client's GitHub Actions workflow can assume via the OIDC
   provider to deploy that client's site stack. One is synthesized per
@@ -64,9 +69,16 @@ stack rather than creating a new one.
 | `api.memory`            | no       | Lambda memory in MB, 128–10240. Defaults to `256`.                          |
 | `api.timeout`           | no       | Lambda timeout in seconds, 1–30 (API Gateway's integration cap). Defaults to `10`. |
 | `api.stack_name`        | no       | Production's API stack name. Defaults to `<slug>-api`; other environments default to `<slug>-<subdomain>-api`. |
-| `api.env`               | no       | Plain env vars for the function. `AWS_`/`LAMBDA_`/`_`-prefixed keys, the Parameters and Secrets extension's `PARAMETERS_SECRETS_EXTENSION_`/`SSM_PARAMETER_STORE_`/`SECRETS_MANAGER_` prefixes, and the stack-set `ALLOWED_ORIGINS`, `ENVIRONMENT`, `API_DOMAIN` are reserved. |
+| `api.env`               | no       | Plain env vars for the function. `AWS_`/`LAMBDA_`/`_`-prefixed keys, the Parameters and Secrets extension's `PARAMETERS_SECRETS_EXTENSION_`/`SSM_PARAMETER_STORE_`/`SECRETS_MANAGER_` prefixes, and the stack-set `ALLOWED_ORIGINS`, `ENVIRONMENT`, `API_DOMAIN` are reserved, as are `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_SECRET_ARN` in environments with a database. |
 | `api.secrets`           | no       | Map of env var key → SSM `SecureString` parameter **name** (e.g. `/client/api/key`), never a value. The function receives the name as `<KEY>_PARAM` and reads the value at runtime. |
-| `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, and `env`/`secrets` (merged over `api.env`/`api.secrets`); no environment may use the `api` subdomain. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
+| `database`              | no       | Postgres settings. **Database stacks are synthesized only if this block is present** (use `database: {}` for all defaults). Every environment with an API gets its own RDS instance. Requires `api` with `api.migrate`. See "API database". |
+| `database.postgres_version` | no   | Major version only, e.g. `"18"` (the default); RDS picks and upgrades the minor version. |
+| `database.instance_class` | no     | RDS instance class. Defaults to `db.t4g.micro`.                             |
+| `database.storage`      | no       | Allocated gp3 storage in GB, 20–65536. Defaults to `20`.                    |
+| `database.max_storage`  | no       | Storage autoscaling ceiling in GB, at least `storage`. Defaults to `100`.   |
+| `database.backup_retention` | no   | Automated backup retention in days, 1–35. Defaults to `7`.                  |
+| `database.stack_name`   | no       | Production's database stack name. Defaults to `<slug>-db`; other environments default to `<slug>-<subdomain>-db`. |
+| `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets? }, database?: { enabled?, stack_name?, postgres_version?, instance_class?, storage?, max_storage?, backup_retention? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, and `env`/`secrets` (merged over `api.env`/`api.secrets`); no environment may use the `api` subdomain. With `database` set, `environments[].database` may set `enabled: false` (no database for that environment), `stack_name`, and any `database` setting (overriding it); it's an error on an environment without an API. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
 
@@ -186,7 +198,8 @@ CONFIG_PATH=path/to/client.yaml API_BUILD_DIR=/tmp/api-build npx cdk deploy <slu
 ```
 
 With `api.migrate` set, also build the migration package into its own
-directory and pass it as `API_MIGRATE_BUILD_DIR`.
+directory and pass it as `API_MIGRATE_BUILD_DIR`. With a database, also pass
+`API_DATABASE_PARAMETERS` (see "API database").
 
 A hand-run deploy turns maintenance mode **off** unless you also pass
 `API_MAINTENANCE=on` (check first with `STACK=<stack> bin/api-maintenance.sh
@@ -209,7 +222,7 @@ with goose and migrations embedded in the binary:
 var migrations embed.FS
 
 func handler(ctx context.Context) error {
-    db, err := openDB(ctx) // e.g. DATABASE_URL_PARAM via the secrets extension
+    db, err := openDB(ctx) // with a cloudbuilder database, see "API database"
     if err != nil {
         return err
     }
@@ -240,12 +253,140 @@ How it behaves:
   (below) before deploying, so no old code serves the new schema.
 - **Environments sharing a database:** every environment with an API runs
   its migrations on deploy. If preview and production point at the same
-  database, a preview deploy migrates production's schema.
+  database, a preview deploy migrates production's schema. A cloudbuilder
+  `database:` gives each environment its own instance, so this can't happen.
 - **Not on hotswap:** `cdk deploy --hotswap` / `cdk watch` update code without
   going through CloudFormation, so migrations don't run.
 
 Output goes to the stack's `MigrateLogs` log group. A failed run's error also
 appears in the CloudFormation events for the `MigrateTrigger` resource.
+
+## API database
+
+With a `database:` block, every environment with an API gets its own RDS
+Postgres instance in its own stack (`<slug>-db`, `<slug>-<subdomain>-db`).
+The design and its tradeoffs are in `docs/database.md`. In short, the
+instance is **publicly reachable**, so the API Lambdas need no VPC or NAT and
+can still call Stripe and other outside services. TLS is forced, the API
+authenticates with short-lived IAM tokens, and the master password lives in
+Secrets Manager. The instance has encrypted storage, automated backups,
+deletion protection, and a final snapshot on stack deletion. A `db.t4g.micro`
+environment costs about $18/month.
+
+### Setting one up
+
+1. Add `database: {}` (or settings) to the API repo's `client.yaml`, which
+   must also set `api.migrate`.
+2. Redeploy the API repo's `github-deploy-role-*` stack, so the role can read
+   the new database's connection parameters.
+3. Deploy the database stack **by hand**. Workflows never deploy it:
+   ```
+   CONFIG_PATH=path/to/client.yaml npx cdk deploy <slug>-db
+   ```
+   It publishes `host`, `port`, `resource-id`, and `secret-arn` as SSM
+   parameters under `/cloudbuilder/<database stack>/`.
+4. Add the first migration below, then deploy the API through
+   `api-deploy.yml`. The workflow reads those SSM parameters and passes them
+   to the CDK app as `API_DATABASE_PARAMETERS`; if the database stack doesn't
+   exist yet, it fails before deploying and names the missing parameters.
+
+For a hand-run API deploy, pass the same JSON yourself:
+`API_DATABASE_PARAMETERS='{"stack":"<slug>-db","host":"...","port":"5432","resource-id":"db-...","secret-arn":"arn:..."}'`.
+
+### What the API and migrations get
+
+| | API function | Migration function |
+|---|---|---|
+| Env vars | `DB_HOST`, `DB_PORT`, `DB_NAME` (`app`), `DB_USER` (`app`) | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_SECRET_ARN` |
+| Connects as | `app`, with an IAM auth token | `postgres` (master), with the password from the secret |
+| Permission | `rds-db:connect` for `app` on this instance only | `secretsmanager:GetSecretValue` on this secret only |
+
+The API's `app` role can read and write data but not change the schema;
+migrations own it. Only SQL can create that role, so **the first migration
+must**:
+
+```sql
+CREATE ROLE app WITH LOGIN;
+GRANT rds_iam TO app;
+GRANT USAGE ON SCHEMA public TO app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app;
+```
+
+`ALTER DEFAULT PRIVILEGES` covers tables the master user creates later, so
+later migrations don't need their own grants.
+
+### Connecting from Go
+
+Every connection uses TLS, verified against the RDS CA bundle
+(`https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`), which
+isn't in the system trust store, so embed it. The API mints an IAM token for
+each new connection (tokens expire after 15 minutes; open connections stay
+up), with pgx and `github.com/aws/aws-sdk-go-v2/feature/rds/auth`:
+
+```go
+//go:embed global-bundle.pem
+var rdsCABundle []byte
+
+func newPool(ctx context.Context) (*pgxpool.Pool, error) {
+    awsCfg, err := config.LoadDefaultConfig(ctx)
+    if err != nil {
+        return nil, err
+    }
+    host, port, user := os.Getenv("DB_HOST"), os.Getenv("DB_PORT"), os.Getenv("DB_USER")
+    cfg, err := pgxpool.ParseConfig(fmt.Sprintf(
+        "host=%s port=%s dbname=%s user=%s sslmode=verify-full",
+        host, port, os.Getenv("DB_NAME"), user))
+    if err != nil {
+        return nil, err
+    }
+    roots := x509.NewCertPool()
+    roots.AppendCertsFromPEM(rdsCABundle)
+    cfg.ConnConfig.TLSConfig.RootCAs = roots
+    // Each Lambda instance handles one request at a time.
+    cfg.MaxConns = 2
+    cfg.BeforeConnect = func(ctx context.Context, cc *pgx.ConnConfig) error {
+        token, err := auth.BuildAuthToken(ctx, host+":"+port, awsCfg.Region, user, awsCfg.Credentials)
+        if err != nil {
+            return err
+        }
+        cc.Password = token
+        return nil
+    }
+    return pgxpool.NewWithConfig(ctx, cfg)
+}
+```
+
+Migrations read the master password through the Parameters and Secrets
+extension already attached to the function, then connect the same way
+(`stdlib.OpenDB(*cfg)` gives goose its `*sql.DB`):
+
+```go
+req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+    "http://localhost:2773/secretsmanager/get?secretId="+url.QueryEscape(os.Getenv("DB_SECRET_ARN")), nil)
+req.Header.Set("X-Aws-Parameters-Secrets-Token", os.Getenv("AWS_SESSION_TOKEN"))
+// The response's SecretString is JSON with "username" and "password".
+```
+
+### Connecting by hand
+
+The endpoint and secret ARN are the database stack's `Endpoint` and
+`SecretArn` outputs:
+
+```
+aws secretsmanager get-secret-value --secret-id <SecretArn> --query SecretString --output text
+curl -o global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+psql "host=<Endpoint> port=5432 dbname=app user=postgres sslmode=verify-full sslrootcert=global-bundle.pem"
+```
+
+### Changing or removing a database
+
+Edit `client.yaml` and `cdk deploy` the database stack by hand; check `cdk
+diff` first, since some changes (e.g. a storage *decrease*) aren't possible
+in place. Deleting the stack fails until deletion protection is turned off
+on the instance, and even then leaves a final snapshot.
 
 ## API maintenance mode
 
@@ -349,4 +490,5 @@ npm test                                                             # run confi
 npx cdk synth github-oidc-bootstrap                                  # render the bootstrap template
 CONFIG_PATH=path/to/client.yaml npx cdk synth <stack-name>           # render a client's site template
 CONFIG_PATH=path/to/client.yaml npx cdk synth github-deploy-role-<slug>-<repo>  # render a deploy-role template
+CONFIG_PATH=path/to/client.yaml npx cdk synth <slug>-db              # render a database template
 ```
