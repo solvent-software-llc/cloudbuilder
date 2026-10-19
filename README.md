@@ -128,6 +128,8 @@ AWS_PROFILE=<client admin> npx --allow-git=root github:solvent-software-llc/clou
   `deploy`, stack names, and options.
 - **Version:** pin the same ref the repo's workflows use (`@v2` /
   `cloudbuilder-ref: v2`), so a hand deploy runs the same CDK code as CI.
+  npx checks the ref again on every run, so a moved tag is picked up next
+  time.
 - **`--allow-git=root`:** npm 12 refuses git dependencies by default. This
   opts in for the one package you name, not its dependencies.
 - **First run** takes a couple of minutes to install the CDK; later runs

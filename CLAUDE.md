@@ -135,6 +135,24 @@ bootstrap template), trusts the whole account, and the GitHub deploy role
 may assume it (`AssumeCdkBootstrapRoles`). The same applies to every
 per-stack CloudFormation scoping in that role; see the next section.
 
+**`bin/cloudbuilder.mjs` (the npx command) has three easy-to-break
+details.** It's what `npx --allow-git=root github:solvent-software-llc/
+cloudbuilder#<ref>` runs.
+- npx hoists this package's dependencies out of its own directory, so
+  cdk.json's `npx ts-node bin/app.ts` can't find them. The command passes
+  its own `--app` and resolves the CDK CLI with `createRequire`.
+- That `--app` must contain no absolute paths. The CDK CLI splits it on
+  spaces, quoted or not, and Node can live under `~/Library/Application
+  Support/...` (confirmed on a Herd-managed Node). It runs from the package
+  directory with `node -r ts-node/register/transpile-only bin/app.ts`
+  instead.
+- `aws-cdk`, `ts-node`, and `typescript` must stay in `dependencies`, not
+  `devDependencies`, because npx installs only those. Transpile-only is
+  because no `@types` packages get installed.
+
+npm 12 refuses git dependencies by default, hence `--allow-git=root` in
+every documented invocation.
+
 ## The deploy role's IAM scoping is weaker than it looks — by design, for now
 
 `github-deploy-role.ts`'s policy is written per-service and per-resource (a
