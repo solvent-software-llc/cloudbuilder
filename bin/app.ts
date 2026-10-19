@@ -4,6 +4,7 @@ import { GithubOidc } from "../src/oidc";
 import { StaticSite } from "../src/static-site";
 import { GithubDeployRole } from "../src/github-deploy-role";
 import { Api } from "../src/api";
+import { Database } from "../src/database";
 import { load } from "../src/config";
 
 const app = new cdk.App();
@@ -59,6 +60,15 @@ if (configPath) {
             buildDir: process.env.API_BUILD_DIR,
             migrateBuildDir: process.env.API_MIGRATE_BUILD_DIR,
             maintenance: apiMaintenance === "on",
+            env: { region: config.aws.region },
+        });
+    }
+    for (const environment of config.environments) {
+        if (!environment.database) continue;
+        new Database(app, environment.database.stackName, {
+            config,
+            environment,
+            database: environment.database,
             env: { region: config.aws.region },
         });
     }

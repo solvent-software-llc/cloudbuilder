@@ -187,7 +187,7 @@ describe("load: database", () => {
             },
             {
                 stackName: "preview-db",
-                postgresVersion: "19",
+                postgresVersion: "17",
                 instanceClass: "db.t4g.micro",
                 storageGb: 30,
                 maxStorageGb: 100,
