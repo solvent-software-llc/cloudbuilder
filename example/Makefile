@@ -15,10 +15,13 @@ DEPLOY_ROLE_STACK ?= github-deploy-role-solvent-software-example-site
 # The database stack for db-diff/db-deploy (API repo only). Production's by
 # default; pass another, e.g. `make db-deploy DB=solvent-software-preview-db`.
 DB ?= solvent-software-db
+# The email stack for email-diff/email-deploy (API repo only, with an email:
+# block). One per client, shared by every environment.
+EMAIL ?= solvent-software-email
 
 CLOUDBUILDER ?= npx -y --allow-git=root github:solvent-software-llc/cloudbuilder\#$(CLOUDBUILDER_REF)
 
-.PHONY: stacks cdk-bootstrap oidc-bootstrap deploy-role db-diff db-deploy
+.PHONY: stacks cdk-bootstrap oidc-bootstrap deploy-role db-diff db-deploy email-diff email-deploy
 
 # List this client's stacks.
 stacks:
@@ -45,3 +48,11 @@ db-diff:
 
 db-deploy:
 	$(CLOUDBUILDER) deploy $(DB)
+
+# API repo only. Removing an identity from client.yaml deletes it, which stops
+# all sending from it.
+email-diff:
+	$(CLOUDBUILDER) diff $(EMAIL)
+
+email-deploy:
+	$(CLOUDBUILDER) deploy $(EMAIL)

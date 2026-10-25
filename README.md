@@ -80,6 +80,9 @@ stack rather than creating a new one.
 | `database.max_storage`  | no       | Storage autoscaling ceiling in GB, at least `storage`. Defaults to `100`.   |
 | `database.backup_retention` | no   | Automated backup retention in days, 1–35. Defaults to `7`.                  |
 | `database.stack_name`   | no       | Production's database stack name. Defaults to `<slug>-db`; other environments default to `<slug>-<subdomain>-db`. |
+| `email`                 | no       | SES sending. **The email stack is synthesized only if this block is present** (use `email: {}` to verify just the domain). One stack per client, shared by every environment; every API function may send from its identities. Requires `api`. See "Sending email". |
+| `email.identities`      | no       | List of SES identities to create: `domain` itself (verified with DKIM records added to the hosted zone; covers every address at the domain) and/or email addresses (each verified by a link AWS emails to it). Defaults to `[<domain>]`. Lowercased; no duplicates. |
+| `email.stack_name`      | no       | The email stack's name. Defaults to `<slug>-email`.                         |
 | `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets? }, database?: { enabled?, stack_name?, postgres_version?, instance_class?, storage?, max_storage?, backup_retention? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, and `env`/`secrets` (merged over `api.env`/`api.secrets`); no environment may use the `api` subdomain. With `database` set, `environments[].database` may set `enabled: false` (no database for that environment), `stack_name`, and any `database` setting (overriding it); it's an error on an environment without an API. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
@@ -128,6 +131,7 @@ Set its variables for the repo:
 | `CLOUDBUILDER_REF` | The same ref the repo's workflows pin (`@v2` / `cloudbuilder-ref: v2`), so a hand deploy runs the same CDK code as CI. |
 | `DEPLOY_ROLE_STACK` | This repo's `github-deploy-role-*` stack, as `make stacks` lists it. |
 | `DB` | API repo only: production's database stack (`<slug>-db`). |
+| `EMAIL` | API repo only, with an `email:` block: the email stack (`<slug>-email`). |
 | `AWS_REGION` | Leave as `us-east-1` (the static tier's only region). |
 
 Then run each target with an admin profile for the client's account, e.g.
@@ -140,6 +144,7 @@ Then run each target with an admin profile for the client's account, e.g.
 | `make oidc-bootstrap` | Once per AWS account, from any one client repo | Deploys `github-oidc-bootstrap` (see "Account bootstrap") |
 | `make deploy-role` | Once per repo, and again after changing `client.yaml`'s environments, stack names, or databases | Deploys this repo's deploy role |
 | `make db-diff` / `make db-deploy` | API repo: first setup, then any database change | Diffs/deploys the database stack. `DB=<stack>` picks another environment's, e.g. `make db-deploy DB=acme-preview-db` |
+| `make email-diff` / `make email-deploy` | API repo with an `email:` block: first setup, then any identity change | Diffs/deploys the email stack (see "Sending email") |
 
 For a brand-new client account, in order:
 
@@ -149,7 +154,9 @@ For a brand-new client account, in order:
    that repo's `AWS_ROLE_ARN` variable for the workflows
 4. API repo with a database: `make db-diff`, then `make db-deploy`, for each
    environment (see "API database")
-5. Push, and the workflows deploy the site and API
+5. API repo with an `email:` block: `make email-diff`, then `make email-deploy`
+   (see "Sending email")
+6. Push, and the workflows deploy the site and API
 
 How it works: each target runs
 `npx --allow-git=root github:solvent-software-llc/cloudbuilder#<ref> <cdk
@@ -455,6 +462,70 @@ Edit `client.yaml`, then `make db-diff` and `make db-deploy` (with
 `DB=<stack>` for a non-production environment). Read the diff first, since
 some changes (e.g. a storage *decrease*) aren't possible in place. Deleting the stack fails until deletion protection is turned off
 on the instance, and even then leaves a final snapshot.
+
+## Sending email
+
+With an `email:` block, the API repo gets one `<slug>-email` stack of SES
+identities, and every environment's API function may send from them
+(`ses:SendEmail` and `ses:SendRawEmail` on those identities only; the
+migration and maintenance functions get nothing).
+
+```yaml
+email:
+  identities:            # optional; defaults to [<domain>]
+    - example.com        # any address @example.com can send
+    - you@gmail.com      # e.g. a test recipient while in the sandbox
+```
+
+### Setting it up
+
+1. Add the block to the API repo's `client.yaml`.
+2. Deploy the email stack **by hand**; workflows never deploy it:
+   ```
+   AWS_PROFILE=<client admin> make email-diff
+   AWS_PROFILE=<client admin> make email-deploy
+   ```
+3. Verify the identities. The domain verifies itself: the stack adds its
+   three DKIM CNAME records to the hosted zone, and SES picks them up
+   (usually within minutes, up to 72 hours). Each address gets an email from
+   AWS with a link that has to be clicked. Check with
+   `aws sesv2 get-email-identity --email-identity <identity>`.
+4. Deploy the API (push). Its permission is built from the identity names,
+   so it doesn't depend on the email stack, but sending fails until the
+   identity is verified.
+
+The API sends with the SES v2 `SendEmail` call in the stack's region. Its
+From address must be at a verified domain identity (any address
+`@example.com`) or be a verified address identity exactly.
+
+### The SES sandbox
+
+A new account starts in the SES sandbox: it can only send **to** verified
+identities, at most 200 emails a day. While testing, list your own address
+under `identities` so it's verified and covered by the API's permission.
+Leaving the sandbox is an account-level request AWS reviews (usually within
+a day), so it isn't part of any stack:
+
+```
+aws sesv2 put-account-details --production-access-enabled \
+  --mail-type TRANSACTIONAL --website-url https://example.com \
+  --use-case-description "Account emails (welcome, password reset) for example.com users" \
+  --contact-language EN
+```
+
+### Limitations
+
+- An identity that already exists in the account (e.g. created in the
+  console) makes `email-deploy` fail; delete it there first, or leave it
+  out of `identities`.
+- Removing an identity from the list deletes it on the next `email-deploy`,
+  and sending from it stops.
+- Only the client's own `domain` can be a domain identity: its DKIM records
+  go in `aws.hosted_zone_id`. Subdomains and other domains aren't supported.
+- DMARC and a custom MAIL FROM domain aren't managed. Gmail and Yahoo
+  require DMARC for bulk senders; add a `_dmarc.<domain>` TXT record by hand
+  if you need one (cloudbuilder doesn't create it, since many domains
+  already have one and a second would conflict).
 
 ## API maintenance mode
 
