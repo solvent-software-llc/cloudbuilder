@@ -5,6 +5,7 @@ import { StaticSite } from "../src/static-site";
 import { GithubDeployRole } from "../src/github-deploy-role";
 import { Api } from "../src/api";
 import { Database } from "../src/database";
+import { Email } from "../src/email";
 import { DATABASE_PARAMETERS, DatabaseParameter, load } from "../src/config";
 
 const app = new cdk.App();
@@ -94,6 +95,13 @@ if (configPath) {
             config,
             environment,
             database: environment.database,
+            env: { region: config.aws.region },
+        });
+    }
+    if (config.email) {
+        new Email(app, config.email.stackName, {
+            config,
+            email: config.email,
             env: { region: config.aws.region },
         });
     }
