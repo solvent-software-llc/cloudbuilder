@@ -77,6 +77,21 @@ export interface Config {
         org: string;
         repos: string[];
     };
+    // SES identities the API functions may send from. Identities are
+    // account-wide, so there's one stack per client, not per environment.
+    // See README's "Sending email".
+    email?: {
+        stackName: string;
+        identities: EmailIdentity[];
+    };
+}
+
+// A domain identity covers every address at the domain and is verified with
+// DKIM records in the hosted zone; an address identity is verified by a link
+// AWS emails to it.
+export interface EmailIdentity {
+    name: string;
+    kind: "domain" | "address";
 }
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
@@ -116,6 +131,9 @@ export function databaseParameterPrefix(stackName: string): string {
 const DATABASE_ENV_KEYS = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_SECRET_ARN"];
 const POSTGRES_MAJOR_RE = /^[1-9][0-9]*$/;
 const INSTANCE_CLASS_RE = /^db\.[a-z0-9-]+\.[a-z0-9]+$/;
+// Deliberately loose: SES itself rejects anything it can't verify.
+const EMAIL_ADDRESS_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
 // gp3 limits for RDS for PostgreSQL.
 const MIN_STORAGE_GB = 20;
 const MAX_STORAGE_GB = 65536;
@@ -501,6 +519,57 @@ export function load(path: string): Config {
         });
     }
 
+    const rawEmail = raw.email;
+    let email: Config["email"];
+    if (rawEmail !== undefined) {
+        if (rawEmail === null || typeof rawEmail !== "object" || Array.isArray(rawEmail)) {
+            throw new Error(`client.yaml: email must be a mapping (use "email: {}" to verify just the domain)`);
+        }
+        // Only API functions send email, and keeping identities in the API
+        // repo's client.yaml stops two repos deploying the same identities.
+        if (!apiConfig) {
+            throw new Error(`client.yaml: email requires an api block`);
+        }
+        const rawIdentities = rawEmail.identities ?? [raw.domain];
+        if (!Array.isArray(rawIdentities) || rawIdentities.length === 0) {
+            throw new Error(`client.yaml: email.identities must be a non-empty list`);
+        }
+        const seenIdentities = new Set<string>();
+        const identities: EmailIdentity[] = rawIdentities.map((rawIdentity: unknown) => {
+            if (typeof rawIdentity !== "string") {
+                throw new Error(`client.yaml: email.identities entries must be strings`);
+            }
+            const name = rawIdentity.toLowerCase();
+            if (seenIdentities.has(name)) {
+                throw new Error(`client.yaml: email.identities lists "${name}" more than once`);
+            }
+            seenIdentities.add(name);
+            if (name.includes("@")) {
+                if (!EMAIL_ADDRESS_RE.test(name)) {
+                    throw new Error(`client.yaml: email.identities entry "${name}" is not an email address`);
+                }
+                return { name, kind: "address" };
+            }
+            // Its DKIM records go in aws.hosted_zone_id, which is the zone for
+            // `domain` only.
+            if (name !== String(raw.domain).toLowerCase()) {
+                throw new Error(
+                    `client.yaml: email.identities entry "${name}" must be ${raw.domain} (the hosted zone's domain) or an email address`,
+                );
+            }
+            return { name, kind: "domain" };
+        });
+        const stackName = rawEmail.stack_name ?? `${raw.slug}-email`;
+        if (!STACK_NAME_RE.test(stackName)) {
+            throw new Error(`client.yaml: email.stack_name "${stackName}" fails ${STACK_NAME_RE}`);
+        }
+        if (seenStackNames.has(stackName)) {
+            throw new Error(`client.yaml: stack name "${stackName}" is used by more than one stack`);
+        }
+        seenStackNames.add(stackName);
+        email = { stackName, identities };
+    }
+
     let github: Config["github"];
     if (raw.github) {
         if (!raw.github.org) {
@@ -542,6 +611,7 @@ export function load(path: string): Config {
         site: site,
         api: apiConfig,
         github: github,
+        email: email,
     };
 }
 

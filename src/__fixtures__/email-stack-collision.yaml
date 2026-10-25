@@ -1,0 +1,13 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+  stack_name: shared-name
+email:
+  stack_name: shared-name
+environments:
+  - name: production
+    branch: main
