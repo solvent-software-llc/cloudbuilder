@@ -223,6 +223,36 @@ describe("load: database", () => {
     });
 });
 
+describe("load: email", () => {
+    it("parses identities, lowercased, with a derived stack name", () => {
+        const config = load(fixture("email"));
+        expect(config.email).toEqual({
+            stackName: "solvent-software-email",
+            identities: [
+                { name: "solventsoftware.com", kind: "domain" },
+                { name: "tester@example.com", kind: "address" },
+            ],
+        });
+    });
+    it("defaults to verifying just the domain", () => {
+        expect(load(fixture("email-defaults")).email?.identities).toEqual([
+            { name: "solventsoftware.com", kind: "domain" },
+        ]);
+    });
+    it("leaves email undefined without an email block", () => {
+        expect(load(fixture("api-migrate")).email).toBeUndefined();
+    });
+    it.each([
+        ["email-without-api", /email requires an api block/],
+        ["email-other-domain", /"otherdomain\.com" must be solventsoftware\.com \(the hosted zone's domain\) or an email address/],
+        ["email-bad-address", /"someone@nowhere" is not an email address/],
+        ["email-duplicate", /lists "tester@example\.com" more than once/],
+        ["email-stack-collision", /stack name "shared-name" is used by more than one stack/],
+    ])("rejects %s", (name, error) => {
+        expect(() => load(fixture(name))).toThrow(error);
+    });
+});
+
 describe("resolveEnvironment", () => {
     it("finds the environment matching a branch", () => {
         const config = load(fixture("all-values"));

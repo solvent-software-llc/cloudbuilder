@@ -13,6 +13,7 @@ import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
 import { Config, DatabaseParameter, Environment } from "./config";
 import { APP_USER, DATABASE_NAME } from "./database";
+import { emailIdentityArn } from "./email";
 
 export interface ApiProps extends cdk.StackProps {
     config: Config;
@@ -156,6 +157,21 @@ export class Api extends cdk.Stack {
             paramsAndSecrets,
         });
         const secretReaders: lambda.Function[] = [fn];
+        // Sending through SES from the client's identities (README's
+        // "Sending email"). The API function only: migrations and the
+        // maintenance function never send. While the account is in the SES
+        // sandbox, recipients must be verified identities too, so test
+        // addresses go in email.identities and are covered here.
+        if (config.email) {
+            fn.addToRolePolicy(
+                new iam.PolicyStatement({
+                    actions: ["ses:SendEmail", "ses:SendRawEmail"],
+                    resources: config.email.identities.map((identity) =>
+                        emailIdentityArn(this, identity.name),
+                    ),
+                }),
+            );
+        }
         if (database) {
             // IAM auth: lets this role mint connection tokens for the `app`
             // role on this environment's instance only.
