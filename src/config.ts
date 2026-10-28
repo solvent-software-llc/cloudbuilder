@@ -24,6 +24,14 @@ export interface Environment {
         // Env var key -> SSM SecureString parameter name. The function receives
         // the name as <KEY>_PARAM and reads the value at runtime.
         secrets: Record<string, string>;
+        // API Gateway throttling on the stage, shared by every client. Unset
+        // means only the account-wide default applies. See README's
+        // "Limiting traffic".
+        throttle?: ApiThrottle;
+        // Reserved concurrency for the API function: at most this many
+        // instances (and their database connections) at once. Unset means
+        // the function shares the account's unreserved pool.
+        maxConcurrency?: number;
     };
     // Present iff the config has a top-level `database:` block and this
     // environment has an API and doesn't opt out with `database.enabled:
@@ -39,6 +47,13 @@ export interface Environment {
         maxStorageGb: number;
         backupRetentionDays: number;
     };
+}
+
+export interface ApiThrottle {
+    // Steady requests per second.
+    rate: number;
+    // Requests absorbed at once above the rate.
+    burst: number;
 }
 
 export interface Config {
@@ -207,6 +222,34 @@ function parseSecrets(raw: unknown, where: string): Record<string, string> {
             return [key, value];
         }),
     );
+}
+
+// Parses an optional `throttle: { rate, burst }` mapping. Both are required
+// when it's set; API Gateway takes a fractional rate but a whole burst.
+function parseThrottle(raw: unknown, where: string): ApiThrottle | undefined {
+    if (raw === undefined) return undefined;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error(`client.yaml: ${where} must be a mapping with rate and burst`);
+    }
+    const { rate, burst } = raw as { rate?: unknown; burst?: unknown };
+    if (typeof rate !== "number" || !(rate > 0)) {
+        throw new Error(`client.yaml: ${where}.rate must be a number of requests per second above 0`);
+    }
+    if (typeof burst !== "number" || !Number.isInteger(burst) || burst < 1) {
+        throw new Error(`client.yaml: ${where}.burst must be a whole number of requests, at least 1`);
+    }
+    return { rate, burst };
+}
+
+// Parses an optional reserved concurrency. 0 would stop the function
+// entirely, so it starts at 1; the upper bound depends on the account's quota,
+// which synth can't see, so too high a value fails at deploy time instead.
+function parseMaxConcurrency(raw: unknown, where: string): number | undefined {
+    if (raw === undefined) return undefined;
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+        throw new Error(`client.yaml: ${where} must be a whole number of instances, at least 1`);
+    }
+    return raw;
 }
 
 function parseIntInRange(raw: unknown, fallback: number, min: number, max: number, where: string): number {
@@ -431,6 +474,9 @@ export function load(path: string): Config {
                     `client.yaml: environments[].subdomain "api" collides with the production API host api.${raw.domain}`,
                 );
             }
+            // Validated even when every environment overrides them.
+            const defaultThrottle = parseThrottle(rawApi.throttle, "api.throttle");
+            const defaultMaxConcurrency = parseMaxConcurrency(rawApi.max_concurrency, "api.max_concurrency");
             const rawEnvApi = env.api ?? {};
             if (rawEnvApi === null || typeof rawEnvApi !== "object") {
                 throw new Error(`client.yaml: environments[].api (environment "${env.name}") must be a mapping`);
@@ -462,7 +508,23 @@ export function load(path: string): Config {
                         );
                     }
                 }
-                api = { stackName, domain: `api.${domain}`, env: envVars, secrets };
+                // An environment's own throttle replaces api.throttle whole.
+                const throttle =
+                    rawEnvApi.throttle !== undefined
+                        ? parseThrottle(rawEnvApi.throttle, `${where}.throttle`)
+                        : defaultThrottle;
+                const maxConcurrency =
+                    rawEnvApi.max_concurrency !== undefined
+                        ? parseMaxConcurrency(rawEnvApi.max_concurrency, `${where}.max_concurrency`)
+                        : defaultMaxConcurrency;
+                api = {
+                    stackName,
+                    domain: `api.${domain}`,
+                    env: envVars,
+                    secrets,
+                    ...(throttle && { throttle }),
+                    ...(maxConcurrency !== undefined && { maxConcurrency }),
+                };
             }
         }
 

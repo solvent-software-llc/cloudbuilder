@@ -73,6 +73,8 @@ stack rather than creating a new one.
 | `api.stack_name`        | no       | Production's API stack name. Defaults to `<slug>-api`; other environments default to `<slug>-<subdomain>-api`. |
 | `api.env`               | no       | Plain env vars for the function. `AWS_`/`LAMBDA_`/`_`-prefixed keys, the Parameters and Secrets extension's `PARAMETERS_SECRETS_EXTENSION_`/`SSM_PARAMETER_STORE_`/`SECRETS_MANAGER_` prefixes, and the stack-set `ALLOWED_ORIGINS`, `ENVIRONMENT`, `API_DOMAIN` are reserved, as are `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_SECRET_ARN` in environments with a database. |
 | `api.secrets`           | no       | Map of env var key → SSM `SecureString` parameter **name** (e.g. `/client/api/key`), never a value. The function receives the name as `<KEY>_PARAM` and reads the value at runtime. |
+| `api.throttle`          | no       | `{ rate, burst }`: API Gateway throttling for each environment's API, in requests per second (`rate`, may be fractional) and requests absorbed at once above it (`burst`, a whole number). Shared by every client; requests over it get a 429. Unset means only AWS's account-wide default applies. See "Limiting traffic". |
+| `api.max_concurrency`   | no       | Reserved concurrency for each environment's API function: the most instances (and so database connections) it can run at once. At least 1. Unset means it shares the account's pool. **Can't be set while the account is at Lambda's starting quota of 10.** See "Limiting traffic". |
 | `database`              | no       | Postgres settings. **Database stacks are synthesized only if this block is present** (use `database: {}` for all defaults). Every environment with an API gets its own RDS instance. Requires `api` with `api.migrate`. See "API database". |
 | `database.postgres_version` | no   | Major version only, e.g. `"18"` (the default); RDS picks and upgrades the minor version. |
 | `database.instance_class` | no     | RDS instance class. Defaults to `db.t4g.micro`.                             |
@@ -83,7 +85,7 @@ stack rather than creating a new one.
 | `email`                 | no       | SES sending. **The email stack is synthesized only if this block is present** (use `email: {}` to verify just the domain). One stack per client, shared by every environment; every API function may send from its identities. Requires `api`. See "Sending email". |
 | `email.identities`      | no       | List of SES identities to create: `domain` itself (verified with DKIM records added to the hosted zone; covers every address at the domain) and/or email addresses (each verified by a link AWS emails to it). Defaults to `[<domain>]`. Lowercased; no duplicates. |
 | `email.stack_name`      | no       | The email stack's name. Defaults to `<slug>-email`.                         |
-| `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets? }, database?: { enabled?, stack_name?, postgres_version?, instance_class?, storage?, max_storage?, backup_retention? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, and `env`/`secrets` (merged over `api.env`/`api.secrets`); no environment may use the `api` subdomain. With `database` set, `environments[].database` may set `enabled: false` (no database for that environment), `stack_name`, and any `database` setting (overriding it); it's an error on an environment without an API. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
+| `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets?, throttle?, max_concurrency? }, database?: { enabled?, stack_name?, postgres_version?, instance_class?, storage?, max_storage?, backup_retention? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, `env`/`secrets` (merged over `api.env`/`api.secrets`), and `throttle`/`max_concurrency` (replacing `api.throttle`/`api.max_concurrency`); no environment may use the `api` subdomain. With `database` set, `environments[].database` may set `enabled: false` (no database for that environment), `stack_name`, and any `database` setting (overriding it); it's an error on an environment without an API. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
 
@@ -275,6 +277,59 @@ directory and pass it as `API_MIGRATE_BUILD_DIR`. With a database, also pass
 A hand-run deploy turns maintenance mode **off** unless you also pass
 `API_MAINTENANCE=on` (check first with `STACK=<stack> bin/api-maintenance.sh
 status`). See below.
+
+## Limiting traffic
+
+Two optional settings cap what an API can be asked to do. Both apply per
+environment, with `environments[].api` overriding them.
+
+```yaml
+api:
+  throttle:
+    rate: 50            # requests/second, steady
+    burst: 100          # spikes absorbed above that
+  max_concurrency: 20   # at most 20 instances at once
+```
+
+### `throttle`: requests per second, at API Gateway
+
+Requests over the limit get `429 {"message":"Too Many Requests"}` from API
+Gateway itself (no `Retry-After` header), so they cost nothing and never
+reach Lambda or the database. Clients should treat any 429 as "back off and
+retry".
+
+- It's one budget shared by **every client**, not a limit per caller: one
+  abusive client can use it up and get everyone 429s. It's a backstop against
+  floods and runaway cost. Limits per account or per user belong in the app,
+  backed by the database.
+- It's stage-wide. Every request goes through the API's single `$default`
+  route, so there's no per-route limit.
+- It also applies in maintenance mode.
+
+### `max_concurrency`: instances, at Lambda
+
+Sets reserved concurrency on the API function (not the migration or
+maintenance functions). Each instance handles one request at a time and holds
+its own database connections, so this caps those connections. With
+`MAX_OPEN_DB_CONNS: 2`, `max_concurrency: 20` means at most ~40. At the cap,
+Lambda rejects further requests rather than queueing them.
+
+Reserved concurrency is set aside from the account's pool, and Lambda
+requires at least 100 of the pool to stay unreserved:
+
+- **New accounts often start with a pool of 10**, and then it can't be set
+  at all: the deploy fails. Leave it unset; the pool already caps the API at
+  10. Check with
+  `aws lambda get-account-settings --query AccountLimit.ConcurrentExecutions`,
+  and request the standard 1,000 (free, usually approved within a day or two):
+  ```
+  aws service-quotas request-service-quota-increase \
+    --service-code lambda --quota-code L-B99A9384 --desired-value 1000
+  ```
+- Every environment's reservation, and any other function's, comes out of
+  the same pool.
+- The CDK app synthesizes without AWS credentials, so it can't check the
+  quota: a value too high for the account only fails at deploy time.
 
 ## Database migrations
 
