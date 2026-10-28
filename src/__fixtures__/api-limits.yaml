@@ -1,0 +1,23 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+  migrate: ./cmd/migrate
+  throttle:
+    rate: 50
+    burst: 100
+  max_concurrency: 20
+environments:
+  - name: production
+    branch: main
+  - name: preview
+    subdomain: preview
+    branch: dev
+    api:
+      throttle:
+        rate: 2.5
+        burst: 10
+      max_concurrency: 2

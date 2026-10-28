@@ -173,6 +173,31 @@ describe("load: api", () => {
     });
 });
 
+describe("load: api throttle and max_concurrency", () => {
+    it("applies api-level limits, with an environment's own overriding them", () => {
+        const [production, preview] = load(fixture("api-limits")).environments;
+        expect(production.api?.throttle).toEqual({ rate: 50, burst: 100 });
+        expect(production.api?.maxConcurrency).toBe(20);
+        expect(preview.api?.throttle).toEqual({ rate: 2.5, burst: 10 });
+        expect(preview.api?.maxConcurrency).toBe(2);
+    });
+    it("leaves both unset by default", () => {
+        const api = load(fixture("api-migrate")).environments[0].api;
+        expect(api).not.toHaveProperty("throttle");
+        expect(api).not.toHaveProperty("maxConcurrency");
+    });
+    it.each([
+        ["api-throttle-not-mapping", /api\.throttle must be a mapping with rate and burst/],
+        ["api-throttle-zero-rate", /api\.throttle\.rate must be a number of requests per second above 0/],
+        ["api-throttle-missing-burst", /api\.throttle\.burst must be a whole number of requests, at least 1/],
+        ["api-throttle-fractional-burst", /api\.throttle\.burst must be a whole number/],
+        ["api-max-concurrency-zero", /api\.max_concurrency must be a whole number of instances, at least 1/],
+        ["env-api-max-concurrency-fractional", /environments\[\]\.api \(environment "production"\)\.max_concurrency must be a whole number/],
+    ])("rejects %s", (name, error) => {
+        expect(() => load(fixture(name))).toThrow(error);
+    });
+});
+
 describe("load: database", () => {
     it("parses the database block with defaults and per-environment overrides", () => {
         const config = load(fixture("database"));
