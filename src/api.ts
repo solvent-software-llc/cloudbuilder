@@ -146,6 +146,11 @@ export class Api extends cdk.Stack {
             memorySize: apiConfig.memoryMb,
             timeout: cdk.Duration.seconds(apiConfig.timeoutSeconds),
             logGroup,
+            // Caps instances, and so database connections. It's set aside
+            // from the account's pool, which must keep at least 100
+            // unreserved: on an account at the starting quota of 10 it can't
+            // be set at all (README's "Limiting traffic").
+            reservedConcurrentExecutions: api.maxConcurrency,
             environment: {
                 ...api.env,
                 ...secretParamEnv,
@@ -280,6 +285,18 @@ export class Api extends cdk.Stack {
             // auto-generated execute-api URL.
             disableExecuteApiEndpoint: true,
         });
+
+        // Throttling on the auto-created $default stage, so it's set on the
+        // stage's resource rather than through HttpStage props; it's an
+        // in-place update. Stage-wide only: every request goes through the
+        // single $default route, so there's no per-route limit to set.
+        if (api.throttle) {
+            const stage = httpApi.defaultStage!.node.defaultChild as apigwv2.CfnStage;
+            stage.defaultRouteSettings = {
+                throttlingRateLimit: api.throttle.rate,
+                throttlingBurstLimit: api.throttle.burst,
+            };
+        }
 
         // Maintenance mode: a second, always-deployed function that answers
         // every request with a 503 (assets/api-maintenance/index.mjs), and its
