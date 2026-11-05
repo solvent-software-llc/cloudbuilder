@@ -267,12 +267,39 @@ describe("load: email", () => {
     it("leaves email undefined without an email block", () => {
         expect(load(fixture("api-migrate")).email).toBeUndefined();
     });
+    it("parses suppression into a configuration set named after the stack, and alarms with default thresholds", () => {
+        const email = load(fixture("email-reputation")).email;
+        expect(email?.configurationSet).toEqual({ name: "solvent-software-email", suppress: ["bounce", "complaint"] });
+        expect(email?.alarms).toEqual({
+            notify: ["ops@example.com", "oncall@example.com"],
+            bouncePercent: 2.5,
+            complaintPercent: 0.05,
+        });
+    });
+    it("takes alarm thresholds in percent", () => {
+        expect(load(fixture("email-alarm-thresholds")).email?.alarms).toMatchObject({
+            bouncePercent: 4,
+            complaintPercent: 0.08,
+        });
+    });
+    it("leaves suppression and alarms off unless set", () => {
+        const email = load(fixture("email")).email;
+        expect(email?.configurationSet).toBeUndefined();
+        expect(email?.alarms).toBeUndefined();
+    });
     it.each([
         ["email-without-api", /email requires an api block/],
         ["email-other-domain", /"otherdomain\.com" must be solventsoftware\.com \(the hosted zone's domain\) or an email address/],
         ["email-bad-address", /"someone@nowhere" is not an email address/],
         ["email-duplicate", /lists "tester@example\.com" more than once/],
         ["email-stack-collision", /stack name "shared-name" is used by more than one stack/],
+        ["email-suppress-empty", /email\.suppress must be a non-empty list/],
+        ["email-suppress-unknown", /email\.suppress entries must be bounce or complaint, not "delivery"/],
+        ["email-suppress-long-stack-name", /email\.stack_name ".*" must be at most 64 characters/],
+        ["email-alarms-no-notify", /email\.alarms\.notify must be a non-empty list/],
+        ["email-alarms-bad-address", /email\.alarms\.notify entry "nobody" is not an email address/],
+        ["email-alarms-zero-percent", /email\.alarms\.bounce_percent must be a percentage above 0 and at most 100/],
+        ["email-alarms-string-percent", /email\.alarms\.complaint_percent must be a percentage above 0 and at most 100/],
     ])("rejects %s", (name, error) => {
         expect(() => load(fixture(name))).toThrow(error);
     });

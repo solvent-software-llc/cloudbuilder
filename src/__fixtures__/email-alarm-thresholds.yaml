@@ -1,0 +1,15 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+email:
+  alarms:
+    notify: [ops@example.com]
+    bounce_percent: 4
+    complaint_percent: 0.08
+environments:
+  - name: production
+    branch: main

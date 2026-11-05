@@ -98,8 +98,24 @@ export interface Config {
     email?: {
         stackName: string;
         identities: EmailIdentity[];
+        // Set by email.suppress: a configuration set, named after the stack,
+        // that every identity sends through by default. SES stops sending to
+        // addresses that bounced or complained, for the listed reasons.
+        configurationSet?: {
+            name: string;
+            suppress: EmailSuppressionReason[];
+        };
+        // Set by email.alarms: who's emailed when the account's bounce or
+        // complaint rate reaches these percentages.
+        alarms?: {
+            notify: string[];
+            bouncePercent: number;
+            complaintPercent: number;
+        };
     };
 }
+
+export type EmailSuppressionReason = "bounce" | "complaint";
 
 // A domain identity covers every address at the domain and is verified with
 // DKIM records in the hosted zone; an address identity is verified by a link
@@ -148,6 +164,12 @@ const POSTGRES_MAJOR_RE = /^[1-9][0-9]*$/;
 const INSTANCE_CLASS_RE = /^db\.[a-z0-9-]+\.[a-z0-9]+$/;
 // Deliberately loose: SES itself rejects anything it can't verify.
 const EMAIL_ADDRESS_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+// SES's limit on configuration set names.
+const CONFIGURATION_SET_NAME_MAX = 64;
+// The rates, in percent, at which SES reviews an account. Alarms default to
+// half, so there's time to act before it does.
+export const SES_REVIEW_PERCENT = { bounce: 5, complaint: 0.1 };
+const DEFAULT_ALARM_PERCENT = { bounce: 2.5, complaint: 0.05 };
 
 // gp3 limits for RDS for PostgreSQL.
 const MIN_STORAGE_GB = 20;
@@ -248,6 +270,58 @@ function parseMaxConcurrency(raw: unknown, where: string): number | undefined {
     if (raw === undefined) return undefined;
     if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
         throw new Error(`client.yaml: ${where} must be a whole number of instances, at least 1`);
+    }
+    return raw;
+}
+
+// Parses an optional `suppress: [bounce, complaint]` list.
+function parseEmailSuppress(raw: unknown): EmailSuppressionReason[] | undefined {
+    if (raw === undefined) return undefined;
+    if (!Array.isArray(raw) || raw.length === 0) {
+        throw new Error(`client.yaml: email.suppress must be a non-empty list of bounce and/or complaint`);
+    }
+    const reasons = new Set<EmailSuppressionReason>();
+    for (const reason of raw) {
+        if (reason !== "bounce" && reason !== "complaint") {
+            throw new Error(`client.yaml: email.suppress entries must be bounce or complaint, not ${JSON.stringify(reason)}`);
+        }
+        reasons.add(reason);
+    }
+    return [...reasons];
+}
+
+// Parses an optional `alarms: { notify, bounce_percent?, complaint_percent? }`
+// mapping.
+function parseEmailAlarms(raw: unknown): NonNullable<NonNullable<Config["email"]>["alarms"]> | undefined {
+    if (raw === undefined) return undefined;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error(`client.yaml: email.alarms must be a mapping with notify`);
+    }
+    const {
+        notify,
+        bounce_percent: bouncePercent = DEFAULT_ALARM_PERCENT.bounce,
+        complaint_percent: complaintPercent = DEFAULT_ALARM_PERCENT.complaint,
+    } = raw as { notify?: unknown; bounce_percent?: unknown; complaint_percent?: unknown };
+    if (!Array.isArray(notify) || notify.length === 0) {
+        throw new Error(`client.yaml: email.alarms.notify must be a non-empty list of email addresses`);
+    }
+    const addresses = new Set<string>();
+    for (const address of notify) {
+        if (typeof address !== "string" || !EMAIL_ADDRESS_RE.test(address)) {
+            throw new Error(`client.yaml: email.alarms.notify entry ${JSON.stringify(address)} is not an email address`);
+        }
+        addresses.add(address.toLowerCase());
+    }
+    return {
+        notify: [...addresses],
+        bouncePercent: parsePercent(bouncePercent, "email.alarms.bounce_percent"),
+        complaintPercent: parsePercent(complaintPercent, "email.alarms.complaint_percent"),
+    };
+}
+
+function parsePercent(raw: unknown, where: string): number {
+    if (typeof raw !== "number" || !(raw > 0) || raw > 100) {
+        throw new Error(`client.yaml: ${where} must be a percentage above 0 and at most 100, e.g. 2.5`);
     }
     return raw;
 }
@@ -630,6 +704,20 @@ export function load(path: string): Config {
         }
         seenStackNames.add(stackName);
         email = { stackName, identities };
+
+        const suppress = parseEmailSuppress(rawEmail.suppress);
+        if (suppress) {
+            if (stackName.length > CONFIGURATION_SET_NAME_MAX) {
+                throw new Error(
+                    `client.yaml: email.suppress names a configuration set after the stack, so email.stack_name "${stackName}" must be at most ${CONFIGURATION_SET_NAME_MAX} characters`,
+                );
+            }
+            email.configurationSet = { name: stackName, suppress };
+        }
+        const alarms = parseEmailAlarms(rawEmail.alarms);
+        if (alarms) {
+            email.alarms = alarms;
+        }
     }
 
     let github: Config["github"];
