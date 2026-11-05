@@ -112,10 +112,18 @@ export interface Config {
             bouncePercent: number;
             complaintPercent: number;
         };
+        // Set by email.dmarc: the domain's DMARC record, published in the
+        // hosted zone.
+        dmarc?: {
+            policy: DmarcPolicy;
+            // Where receivers send aggregate reports; may be empty.
+            reports: string[];
+        };
     };
 }
 
 export type EmailSuppressionReason = "bounce" | "complaint";
+export type DmarcPolicy = "none" | "quarantine" | "reject";
 
 // A domain identity covers every address at the domain and is verified with
 // DKIM records in the hosted zone; an address identity is verified by a link
@@ -302,21 +310,51 @@ function parseEmailAlarms(raw: unknown): NonNullable<NonNullable<Config["email"]
         bounce_percent: bouncePercent = DEFAULT_ALARM_PERCENT.bounce,
         complaint_percent: complaintPercent = DEFAULT_ALARM_PERCENT.complaint,
     } = raw as { notify?: unknown; bounce_percent?: unknown; complaint_percent?: unknown };
-    if (!Array.isArray(notify) || notify.length === 0) {
-        throw new Error(`client.yaml: email.alarms.notify must be a non-empty list of email addresses`);
-    }
-    const addresses = new Set<string>();
-    for (const address of notify) {
-        if (typeof address !== "string" || !EMAIL_ADDRESS_RE.test(address)) {
-            throw new Error(`client.yaml: email.alarms.notify entry ${JSON.stringify(address)} is not an email address`);
-        }
-        addresses.add(address.toLowerCase());
-    }
     return {
-        notify: [...addresses],
+        notify: parseAddressList(notify, "email.alarms.notify"),
         bouncePercent: parsePercent(bouncePercent, "email.alarms.bounce_percent"),
         complaintPercent: parsePercent(complaintPercent, "email.alarms.complaint_percent"),
     };
+}
+
+// Parses an optional `dmarc: { policy?, reports? }` mapping (`dmarc: {}` for
+// all defaults).
+function parseEmailDmarc(raw: unknown): NonNullable<NonNullable<Config["email"]>["dmarc"]> | undefined {
+    if (raw === undefined) return undefined;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new Error(`client.yaml: email.dmarc must be a mapping (use "dmarc: {}" for policy none and no reports)`);
+    }
+    const { policy = "none", reports } = raw as { policy?: unknown; reports?: unknown };
+    if (policy !== "none" && policy !== "quarantine" && policy !== "reject") {
+        throw new Error(`client.yaml: email.dmarc.policy must be none, quarantine or reject, not ${JSON.stringify(policy)}`);
+    }
+    if (reports === undefined) {
+        return { policy, reports: [] };
+    }
+    const addresses = parseAddressList(reports, "email.dmarc.reports");
+    for (const address of addresses) {
+        // They're joined into the record as mailto: URIs, where these would
+        // end or split one.
+        if (/[,;!]/.test(address)) {
+            throw new Error(`client.yaml: email.dmarc.reports entry "${address}" can't contain , ; or !`);
+        }
+    }
+    return { policy, reports: addresses };
+}
+
+// Parses a non-empty list of email addresses, lowercased and deduplicated.
+function parseAddressList(raw: unknown, where: string): string[] {
+    if (!Array.isArray(raw) || raw.length === 0) {
+        throw new Error(`client.yaml: ${where} must be a non-empty list of email addresses`);
+    }
+    const addresses = new Set<string>();
+    for (const address of raw) {
+        if (typeof address !== "string" || !EMAIL_ADDRESS_RE.test(address)) {
+            throw new Error(`client.yaml: ${where} entry ${JSON.stringify(address)} is not an email address`);
+        }
+        addresses.add(address.toLowerCase());
+    }
+    return [...addresses];
 }
 
 function parsePercent(raw: unknown, where: string): number {
@@ -713,6 +751,18 @@ export function load(path: string): Config {
                 );
             }
             email.configurationSet = { name: stackName, suppress };
+        }
+        const dmarc = parseEmailDmarc(rawEmail.dmarc);
+        if (dmarc) {
+            // The domain's mail passes DMARC through SES's DKIM signature for
+            // it (SES's own SPF is for amazonses.com, not the domain), so
+            // without the domain identity a strict policy would block it.
+            if (!identities.some((identity) => identity.kind === "domain")) {
+                throw new Error(
+                    `client.yaml: email.dmarc requires ${raw.domain} in email.identities, since its DKIM signature is what lets the domain's mail pass DMARC`,
+                );
+            }
+            email.dmarc = dmarc;
         }
         const alarms = parseEmailAlarms(rawEmail.alarms);
         if (alarms) {

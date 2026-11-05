@@ -89,6 +89,9 @@ stack rather than creating a new one.
 | `email.alarms.notify`   | no       | List of email addresses alerted when the account's SES bounce or complaint rate reaches its threshold. Required if `email.alarms` is set. See "Bounces and complaints". |
 | `email.alarms.bounce_percent` | no | Bounce-rate alarm threshold, in percent (above 0, at most 100). Defaults to `2.5`, half the rate at which SES reviews an account. |
 | `email.alarms.complaint_percent` | no | Complaint-rate alarm threshold, in percent (above 0, at most 100). Defaults to `0.05`, half the rate at which SES reviews an account. |
+| `email.dmarc`           | no       | Publish a `_dmarc.<domain>` TXT record (use `dmarc: {}` for policy `none` and no reports). Requires `domain` in `email.identities`. Fails to deploy over an existing `_dmarc` record. See "DMARC". |
+| `email.dmarc.policy`    | no       | `none` (default), `quarantine` or `reject`: what receivers do with mail from the domain that fails DMARC. |
+| `email.dmarc.reports`   | no       | List of addresses receivers send daily aggregate reports to (`rua`). Lowercased; can't contain `,` `;` or `!`. An address at another domain needs that domain's permission record; see "DMARC". |
 | `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets?, throttle?, max_concurrency? }, database?: { enabled?, stack_name?, postgres_version?, instance_class?, storage?, max_storage?, backup_retention? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, `env`/`secrets` (merged over `api.env`/`api.secrets`), and `throttle`/`max_concurrency` (replacing `api.throttle`/`api.max_concurrency`); no environment may use the `api` subdomain. With `database` set, `environments[].database` may set `enabled: false` (no database for that environment), `stack_name`, and any `database` setting (overriding it); it's an error on an environment without an API. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
@@ -611,6 +614,43 @@ round, sends would be refused until the API deploy.
 suppression list holds the addresses it's stopped sending to:
 `aws sesv2 list-suppressed-destinations`.
 
+### DMARC
+
+DMARC tells receiving mail servers what to do with mail that claims to be
+from the domain but fails authentication, and where to send reports. It's
+opt-in, since many domains already have a record:
+
+```yaml
+email:
+  dmarc:
+    policy: none                    # none (default), quarantine or reject
+    reports: [dmarc@example.com]    # optional: where daily aggregate reports go
+```
+
+This publishes a `_dmarc.<domain>` TXT record, e.g.
+`v=DMARC1; p=none; rua=mailto:dmarc@example.com`.
+
+- **Mail sent through SES passes through DKIM.** Its DKIM signature is for
+  the domain, which matches the From address. SES's own SPF is for
+  `amazonses.com` and doesn't count, so `dmarc` requires the domain in
+  `identities`.
+- **Start at `none`.** Mail is delivered either way, and the reports show
+  who sends as the domain and whether it passes. Once they show only mail
+  you expect, move to `quarantine` (failing mail goes to spam), then
+  `reject` (refused). Under a strict policy, anything else that sends as
+  the domain without signing it for the domain is blocked too, e.g. a
+  newsletter tool or a helpdesk.
+- **Reports are XML,** one per receiver per day. A DMARC report service
+  reads them for you; a dedicated mailbox works too.
+- **Reports to another domain need its permission.** If a `reports` address
+  isn't at the domain (e.g. `dmarc@other.com` for `example.com`), receivers
+  only send to it if that domain publishes a TXT record
+  `example.com._report._dmarc.other.com` with the value `v=DMARC1`. Report
+  services do this for you; for your own domain, add it by hand.
+- **An existing `_dmarc` record fails `email-deploy`** rather than adding a
+  second, which receivers would ignore. Delete it first, or leave `dmarc`
+  out.
+
 ### Limitations
 
 - An identity that already exists in the account (e.g. created in the
@@ -620,10 +660,8 @@ suppression list holds the addresses it's stopped sending to:
   and sending from it stops.
 - Only the client's own `domain` can be a domain identity: its DKIM records
   go in `aws.hosted_zone_id`. Subdomains and other domains aren't supported.
-- DMARC and a custom MAIL FROM domain aren't managed. Gmail and Yahoo
-  require DMARC for bulk senders; add a `_dmarc.<domain>` TXT record by hand
-  if you need one (cloudbuilder doesn't create it, since many domains
-  already have one and a second would conflict).
+- A custom MAIL FROM domain isn't managed, so SPF never matches the domain;
+  DMARC relies on DKIM alone.
 - Bounce and complaint events aren't delivered to the app; with `suppress`,
   SES just stops sending to those addresses, and the app isn't told.
 

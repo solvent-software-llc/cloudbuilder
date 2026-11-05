@@ -67,6 +67,16 @@ export class Email extends cdk.Stack {
             });
         }
 
+        if (email.dmarc) {
+            // Fails the deploy if the zone already has a _dmarc record, rather
+            // than publishing a second one, which receivers would ignore.
+            new route53.TxtRecord(this, "Dmarc", {
+                zone,
+                recordName: "_dmarc",
+                values: [dmarcRecord(email.dmarc)],
+            });
+        }
+
         if (email.alarms) {
             // SNS emails each address a confirmation link; nothing reaches it
             // until someone clicks it.
@@ -106,6 +116,14 @@ export class Email extends cdk.Stack {
             value: email.identities.map((identity) => identity.name).join(","),
         });
     }
+}
+
+export function dmarcRecord(dmarc: NonNullable<NonNullable<Config["email"]>["dmarc"]>): string {
+    const tags = ["v=DMARC1", `p=${dmarc.policy}`];
+    if (dmarc.reports.length > 0) {
+        tags.push(`rua=${dmarc.reports.map((address) => `mailto:${address}`).join(",")}`);
+    }
+    return tags.join("; ");
 }
 
 function suppressionReasons(reasons: EmailSuppressionReason[]): ses.SuppressionReasons {

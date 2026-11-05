@@ -282,10 +282,20 @@ describe("load: email", () => {
             complaintPercent: 0.08,
         });
     });
-    it("leaves suppression and alarms off unless set", () => {
+    it("leaves suppression, alarms and DMARC off unless set", () => {
         const email = load(fixture("email")).email;
         expect(email?.configurationSet).toBeUndefined();
         expect(email?.alarms).toBeUndefined();
+        expect(email?.dmarc).toBeUndefined();
+    });
+    it("parses DMARC, with report addresses lowercased and deduplicated", () => {
+        expect(load(fixture("email-dmarc")).email?.dmarc).toEqual({
+            policy: "quarantine",
+            reports: ["dmarc@example.com", "reports@dmarc.example.net"],
+        });
+    });
+    it("defaults DMARC to policy none with no reports", () => {
+        expect(load(fixture("email-dmarc-defaults")).email?.dmarc).toEqual({ policy: "none", reports: [] });
     });
     it.each([
         ["email-without-api", /email requires an api block/],
@@ -300,6 +310,11 @@ describe("load: email", () => {
         ["email-alarms-bad-address", /email\.alarms\.notify entry "nobody" is not an email address/],
         ["email-alarms-zero-percent", /email\.alarms\.bounce_percent must be a percentage above 0 and at most 100/],
         ["email-alarms-string-percent", /email\.alarms\.complaint_percent must be a percentage above 0 and at most 100/],
+        ["email-dmarc-not-mapping", /email\.dmarc must be a mapping/],
+        ["email-dmarc-bad-policy", /email\.dmarc\.policy must be none, quarantine or reject, not "block"/],
+        ["email-dmarc-empty-reports", /email\.dmarc\.reports must be a non-empty list/],
+        ["email-dmarc-bad-report", /email\.dmarc\.reports entry "a,b@example\.com" can't contain , ; or !/],
+        ["email-dmarc-without-domain", /email\.dmarc requires solventsoftware\.com in email\.identities/],
     ])("rejects %s", (name, error) => {
         expect(() => load(fixture(name))).toThrow(error);
     });
