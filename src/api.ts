@@ -13,7 +13,7 @@ import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
 import { Config, DatabaseParameter, Environment } from "./config";
 import { APP_USER, DATABASE_NAME } from "./database";
-import { emailIdentityArn } from "./email";
+import { emailConfigurationSetArn, emailIdentityArn } from "./email";
 
 export interface ApiProps extends cdk.StackProps {
     config: Config;
@@ -166,14 +166,18 @@ export class Api extends cdk.Stack {
         // "Sending email"). The API function only: migrations and the
         // maintenance function never send. While the account is in the SES
         // sandbox, recipients must be verified identities too, so test
-        // addresses go in email.identities and are covered here.
+        // addresses go in email.identities and are covered here. SES also
+        // authorizes a send against the configuration set it goes through,
+        // including an identity's default one.
         if (config.email) {
+            const { identities, configurationSet } = config.email;
             fn.addToRolePolicy(
                 new iam.PolicyStatement({
                     actions: ["ses:SendEmail", "ses:SendRawEmail"],
-                    resources: config.email.identities.map((identity) =>
-                        emailIdentityArn(this, identity.name),
-                    ),
+                    resources: [
+                        ...identities.map((identity) => emailIdentityArn(this, identity.name)),
+                        ...(configurationSet ? [emailConfigurationSetArn(this, configurationSet.name)] : []),
+                    ],
                 }),
             );
         }

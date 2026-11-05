@@ -1,0 +1,13 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+email:
+  stack_name: a-very-long-email-stack-name-that-is-more-than-sixty-four-characters
+  suppress: [bounce]
+environments:
+  - name: production
+    branch: main
