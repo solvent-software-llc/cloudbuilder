@@ -53,6 +53,29 @@ describe("email stack", () => {
     });
 });
 
+describe("email stack with DMARC", () => {
+    it("publishes the policy and report addresses at _dmarc", () => {
+        const template = emailTemplate("email-dmarc");
+        template.hasResourceProperties("AWS::Route53::RecordSet", {
+            Name: "_dmarc.solventsoftware.com.",
+            Type: "TXT",
+            HostedZoneId: "HS1234",
+            ResourceRecords: ['"v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com,mailto:reports@dmarc.example.net"'],
+        });
+    });
+
+    it("leaves out rua without report addresses", () => {
+        emailTemplate("email-dmarc-defaults").hasResourceProperties("AWS::Route53::RecordSet", {
+            Name: "_dmarc.solventsoftware.com.",
+            ResourceRecords: ['"v=DMARC1; p=none"'],
+        });
+    });
+
+    it("adds no TXT record without dmarc", () => {
+        emailTemplate("email").resourcePropertiesCountIs("AWS::Route53::RecordSet", { Type: "TXT" }, 0);
+    });
+});
+
 describe("email stack with suppression and alarms", () => {
     const template = emailTemplate("email-reputation");
 
