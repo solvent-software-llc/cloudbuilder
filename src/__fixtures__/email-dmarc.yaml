@@ -1,0 +1,17 @@
+slug: solvent-software
+domain: "solventsoftware.com"
+aws:
+  region: us-east-1
+  hosted_zone_id: HS1234
+api:
+  module: api
+email:
+  dmarc:
+    policy: quarantine
+    reports:
+      - DMARC@Example.com
+      - dmarc@example.com
+      - reports@dmarc.example.net
+environments:
+  - name: production
+    branch: main
