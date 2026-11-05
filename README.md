@@ -85,6 +85,10 @@ stack rather than creating a new one.
 | `email`                 | no       | SES sending. **The email stack is synthesized only if this block is present** (use `email: {}` to verify just the domain). One stack per client, shared by every environment; every API function may send from its identities. Requires `api`. See "Sending email". |
 | `email.identities`      | no       | List of SES identities to create: `domain` itself (verified with DKIM records added to the hosted zone; covers every address at the domain) and/or email addresses (each verified by a link AWS emails to it). Defaults to `[<domain>]`. Lowercased; no duplicates. |
 | `email.stack_name`      | no       | The email stack's name. Defaults to `<slug>-email`.                         |
+| `email.suppress`        | no       | List of `bounce` and/or `complaint`: SES stops sending to addresses that did either, through a configuration set every identity uses by default. Named after the stack, so `email.stack_name` must then be at most 64 characters. See "Bounces and complaints". |
+| `email.alarms.notify`   | no       | List of email addresses alerted when the account's SES bounce or complaint rate reaches its threshold. Required if `email.alarms` is set. See "Bounces and complaints". |
+| `email.alarms.bounce_percent` | no | Bounce-rate alarm threshold, in percent (above 0, at most 100). Defaults to `2.5`, half the rate at which SES reviews an account. |
+| `email.alarms.complaint_percent` | no | Complaint-rate alarm threshold, in percent (above 0, at most 100). Defaults to `0.05`, half the rate at which SES reviews an account. |
 | `environments`          | yes      | List of `{ name, branch, subdomain?, site?: { stack_name?, bucket_name? }, api?: { enabled?, stack_name?, env?, secrets?, throttle?, max_concurrency? }, database?: { enabled?, stack_name?, postgres_version?, instance_class?, storage?, max_storage?, backup_retention? } }`. At most one entry may omit `subdomain`: that's the production/root site. Entries with a `subdomain` serve `<subdomain>.<domain>`. With `site` set, every environment gets its own stack, bucket, and CloudFront distribution; `environments[].site.stack_name`/`bucket_name` default to `site.stack_name`/`site.bucket_name` for production and `<slug>-<subdomain>-site` otherwise. With `api` set, `environments[].api` may set `enabled: false` (no API for that environment), `stack_name`, `env`/`secrets` (merged over `api.env`/`api.secrets`), and `throttle`/`max_concurrency` (replacing `api.throttle`/`api.max_concurrency`); no environment may use the `api` subdomain. With `database` set, `environments[].database` may set `enabled: false` (no database for that environment), `stack_name`, and any `database` setting (overriding it); it's an error on an environment without an API. Each `branch`, `subdomain`, stack name, and bucket name must be unique — `branch` is what a deploy workflow run resolves against to pick this environment, and what scopes the GitHub OIDC deploy role's trust policy. V1's `public_env`, `aws.stack_name`, and `aws.bucket_name` are rejected with a pointer to their new location. |
 | `github.org`            | no*      | GitHub org/user the client's repos live under. Required if `github` is set. |
 | `github.repos`          | no       | List of repo names allowed to deploy this client's site. One `github-deploy-role-<slug>-<repo>` stack is synthesized per entry. Defaults to `[]`. |
@@ -568,6 +572,45 @@ aws sesv2 put-account-details --production-access-enabled \
   --contact-language EN
 ```
 
+### Bounces and complaints
+
+SES watches each account's bounce and complaint rates. It reviews an account
+at about 5% bounces or 0.1% complaints, and can pause its sending at about
+10% or 0.5%. AWS also asks how you handle both when you request production
+access. Two opt-in settings cover it:
+
+```yaml
+email:
+  suppress: [bounce, complaint]   # stop sending to addresses that bounced or complained
+  alarms:
+    notify: [ops@example.com]     # who hears when the rates climb
+    bounce_percent: 2.5           # optional; the default
+    complaint_percent: 0.05       # optional; the default
+```
+
+- **`suppress`** creates a configuration set named after the email stack,
+  with SES's suppression for the listed reasons, and makes it every
+  identity's default. Sends go through it without the app naming it, and SES
+  quietly drops mail to an address that hard-bounced or complained. The
+  API function's permission covers the configuration set too, since SES
+  checks it on every send through it.
+- **`alarms`** emails `notify` (through an SNS topic) when the account's
+  bounce rate reaches `bounce_percent` or its complaint rate
+  `complaint_percent`, and again when it recovers. The defaults, 2.5% and
+  0.05%, are half the review levels; raise them only if you'd still have
+  time to act before SES does. Each address gets a confirmation email from
+  AWS first, and nothing reaches it until the link is clicked.
+
+**Turning `suppress` on:** deploy the API first (push), then
+`make email-deploy`. The API's permission for the configuration set is
+built from its name, so it can go out before the set exists; the other way
+round, sends would be refused until the API deploy.
+
+**When an alarm fires:** find where the bounces or complaints come from
+(e.g. sign-ups with addresses nobody owns), and fix that. SES's own
+suppression list holds the addresses it's stopped sending to:
+`aws sesv2 list-suppressed-destinations`.
+
 ### Limitations
 
 - An identity that already exists in the account (e.g. created in the
@@ -581,6 +624,8 @@ aws sesv2 put-account-details --production-access-enabled \
   require DMARC for bulk senders; add a `_dmarc.<domain>` TXT record by hand
   if you need one (cloudbuilder doesn't create it, since many domains
   already have one and a second would conflict).
+- Bounce and complaint events aren't delivered to the app; with `suppress`,
+  SES just stops sending to those addresses, and the app isn't told.
 
 ## API maintenance mode
 
