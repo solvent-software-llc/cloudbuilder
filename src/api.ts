@@ -246,15 +246,17 @@ export class Api extends cdk.Stack {
             });
         }
 
-        // SecureStrings encrypted with the AWS-managed aws/ssm key need no
-        // kms:Decrypt grant: that key's policy already allows decryption via
-        // SSM for any principal in the account allowed to call GetParameter.
+        // GetParameters reads several of these in one call, e.g. an app
+        // refreshing runtime settings; it's allowed on the same parameters
+        // only. SecureStrings encrypted with the AWS-managed aws/ssm key need
+        // no kms:Decrypt grant: that key's policy already allows decryption
+        // via SSM for any principal in the account allowed to read them.
         const parameterNames = [...new Set(Object.values(api.secrets))];
         if (parameterNames.length > 0) {
             for (const reader of secretReaders) {
                 reader.addToRolePolicy(
                     new iam.PolicyStatement({
-                        actions: ["ssm:GetParameter"],
+                        actions: ["ssm:GetParameter", "ssm:GetParameters"],
                         // Names are validated as hierarchical (leading "/"), so the
                         // ARN is just parameter<name>.
                         resources: parameterNames.map(

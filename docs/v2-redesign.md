@@ -222,8 +222,8 @@ Mobile: same token system, different transport for the refresh token.
   holds SSM parameter names; the function gets each as `<KEY>_PARAM` and
   fetches the value through the AWS Parameters and Secrets Lambda Extension
   (5-minute cache). Values never appear in the CloudFormation template or the
-  Lambda console. The function's role gets `ssm:GetParameter` on exactly those
-  parameters; `aws/ssm`-encrypted SecureStrings need no extra KMS grant.
+  Lambda console. The function's role gets `ssm:GetParameter` and
+  `ssm:GetParameters` (several in one call) on exactly those parameters; `aws/ssm`-encrypted SecureStrings need no extra KMS grant.
 
 ## Open questions
 
